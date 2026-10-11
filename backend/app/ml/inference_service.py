@@ -53,12 +53,30 @@ class MLInferenceEngine:
         weight = assessment_data.get("weight_kg") or 69.8
         bmi = weight / ((height / 100.0) ** 2) if height > 0 else 26.28
 
+        # Vitals & Anthropometrics
+        sys_bp = assessment_data.get("systolic_bp")
+        dia_bp = assessment_data.get("diastolic_bp")
+        pulse = assessment_data.get("pulse_bpm")
+        spo2 = assessment_data.get("spo2_pct")
+        temp = assessment_data.get("temperature_c")
+        resp_rate = assessment_data.get("respiratory_rate")
+        waist = assessment_data.get("waist_cm")
+        hip = assessment_data.get("hip_cm")
+        muac = assessment_data.get("mid_upper_arm_circ_cm") # Bicep / Mid-upper arm circ
+        chest = assessment_data.get("chest_cm")
+
         # 2. Deficit Frailty Index Calculation
-        # Clinical Deficit items:
+        # Clinical Deficit items expanded for nursing home & ambulatory monitoring:
         # - High BMI (>28) or Low (<18.5)
         # - Diabetes, Hypertension, Stroke, Heart Disease
         # - Walking difficulty, Stairs difficulty, Chair rise difficulty
-        # - Memory deficit (<10), Recall deficit (<10)
+        # - Memory deficit (<8), Recall deficit (<8)
+        # - Vitals deficits:
+        #     * Elevated/Abnormal Blood Pressure (SBP >= 140 or DBP >= 90 or SBP < 90)
+        #     * Tachycardia/Bradycardia (Pulse > 100 or Pulse < 50)
+        #     * Hypoxia / Low SpO2 (< 94%)
+        #     * Sarcopenia / Muscle wasting indicators: Low MUAC/bicep (<22 cm in elderly)
+        #     * Central adiposity / metabolic risk: Waist-to-hip ratio or high waist (>88cm F, >102cm M, or >95cm general)
         deficits = []
         deficits.append(1.0 if (bmi > 28.0 or bmi < 18.5) else 0.0)
         deficits.append(1.0 if assessment_data.get("has_diabetes") else 0.0)
@@ -71,6 +89,29 @@ class MLInferenceEngine:
         deficits.append(1.0 if float(assessment_data.get("memory_score", 10.0)) < 8.0 else 0.0)
         deficits.append(1.0 if float(assessment_data.get("recall_score", 10.0)) < 8.0 else 0.0)
         
+        # Vitals deficits
+        if sys_bp is not None and dia_bp is not None:
+            deficits.append(1.0 if (sys_bp >= 140 or dia_bp >= 90 or sys_bp < 95) else 0.0)
+        elif assessment_data.get("has_hypertension"):
+            deficits.append(1.0)
+        else:
+            deficits.append(0.0)
+
+        if pulse is not None:
+            deficits.append(1.0 if (pulse > 100 or pulse < 50) else 0.0)
+
+        if spo2 is not None:
+            deficits.append(1.0 if spo2 < 94.0 else 0.0)
+
+        # Body Anthropometrics & Sarcopenia / Frailty markers
+        if muac is not None:
+            # Low Mid-Upper Arm Circumference indicates clinical sarcopenia / muscle wasting (< 23cm)
+            deficits.append(1.0 if muac < 23.0 else 0.0)
+
+        if waist is not None:
+            # High abdominal waist circumference indicates high cardiometabolic risk (> 95cm)
+            deficits.append(1.0 if waist > 95.0 else 0.0)
+
         # Polypharmacy deficit (>=5 meds)
         meds_count = assessment_data.get("medications_count", 0)
         is_polypharmacy = meds_count >= 5
@@ -134,7 +175,6 @@ class MLInferenceEngine:
             risk_tier = "High"
 
         # 7. Estimated Time to Loss of Independence (Simulation approximation)
-        # Higher risk -> shorter time
         if overall_risk >= 0.70:
             est_years = max(1, int(round((1.0 - overall_risk) * 6)))
         elif overall_risk >= 0.45:
@@ -144,12 +184,14 @@ class MLInferenceEngine:
 
         # 8. Clinical Recommendations & SHAP Contributions
         contributions = {
-            "Frailty Index": round(frailty_index * 0.40, 3),
+            "Frailty Deficit Burden": round(frailty_index * 0.40, 3),
             "Age Factor": round(age_factor * 0.20, 3),
-            "Mobility & Gait": round(float(assessment_data.get("walking_difficulty", 0)) * 0.15, 3),
-            "Cardiometabolic Load": round(0.12 if assessment_data.get("has_diabetes") or assessment_data.get("has_stroke") else 0.02, 3),
+            "Mobility & Gait Limitation": round(float(assessment_data.get("walking_difficulty", 0)) * 0.15, 3),
+            "Cardiovascular & Hemodynamic Stress": round(0.12 if (sys_bp and (sys_bp > 140 or sys_bp < 95)) or assessment_data.get("has_hypertension") else 0.02, 3),
+            "Pulse & Respiratory Stability": round(0.08 if (pulse and (pulse > 100 or pulse < 50)) or (spo2 and spo2 < 94) else 0.01, 3),
+            "Sarcopenia & Arm/Waist Wasting": round(0.09 if (muac and muac < 23.0) or (waist and waist > 100) else 0.02, 3),
             "Polypharmacy Burden": round(0.10 if is_polypharmacy else 0.0, 3),
-            "Cognitive Reserve": round(0.08 if float(assessment_data.get("memory_score", 10.0)) < 8.0 else 0.0, 3)
+            "Cognitive Reserve Loss": round(0.08 if float(assessment_data.get("memory_score", 10.0)) < 8.0 else 0.0, 3)
         }
 
         recommendations = []
@@ -157,13 +199,22 @@ class MLInferenceEngine:
             recommendations.append("Priority comprehensive geriatric assessment (CGA) recommended within 14 days.")
             recommendations.append("Initiate targeted physical therapy and fall-prevention home hazard assessment.")
         elif risk_tier == "Moderate":
-            recommendations.append("Schedule 6-month longitudinal follow-up to re-evaluate functional stability.")
+            recommendations.append("Schedule longitudinal follow-up (4-8 weeks) to re-evaluate functional stability.")
             recommendations.append("Introduce resistance and balance training to decelerate frailty progression.")
         else:
-            recommendations.append("Patient demonstrates stable aging profile. Continue standard annual preventive check-ups.")
+            recommendations.append("Patient demonstrates stable aging profile. Continue standard monitoring protocols.")
 
         if is_polypharmacy:
             recommendations.append("POLYPHARMACY ALERT: Review concurrent medications (≥5 active drugs) to reduce adverse drug interactions and fall risks.")
+
+        if spo2 and spo2 < 94.0:
+            recommendations.append("RESPIRATORY VIGILANCE: Resting SpO2 is subnormal (<94%). Evaluate for occult hypoxemia or pulmonary exacerbation.")
+
+        if muac and muac < 23.0:
+            recommendations.append("NUTRITIONAL & SARCOPENIA INTERVENTION: Mid-upper arm circumference (<23 cm) indicates acute muscle wasting. Dietary protein supplementation recommended.")
+
+        if sys_bp and (sys_bp >= 150 or sys_bp < 95):
+            recommendations.append("HEMODYNAMIC ALERT: Blood pressure readings out of target range. Assess orthostatic hypotension risk.")
 
         return {
             "bmi": round(bmi, 2),

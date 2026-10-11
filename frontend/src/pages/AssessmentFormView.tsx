@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowLeft, Activity, Pill, Heart, Brain, User, AlertCircle } from 'lucide-react';
+import { ArrowLeft, Activity, Pill, Heart, Brain, User, AlertCircle, Thermometer, Gauge, Ruler } from 'lucide-react';
 import { api } from '../lib/api';
 import { Participant } from '../types';
 import { translations } from '../lib/i18n';
@@ -14,19 +14,41 @@ interface AssessmentFormProps {
 export const AssessmentFormView: React.FC<AssessmentFormProps> = ({ participant, onBack, onComplete, lang }) => {
   const t = translations[lang];
 
+  // Assessment Date
+  const [assessmentDate, setAssessmentDate] = useState(new Date().toISOString().split('T')[0]);
+
+  // Vitals & Hemodynamics
   const [heightCm, setHeightCm] = useState(160);
   const [weightKg, setWeightKg] = useState(65);
   const [systolicBp, setSystolicBp] = useState(130);
   const [diastolicBp, setDiastolicBp] = useState(80);
+  const [pulseBpm, setPulseBpm] = useState(72);
+  const [spo2Pct, setSpo2Pct] = useState(98);
+  const [temperatureC, setTemperatureC] = useState(36.6);
+  const [respRate, setRespRate] = useState(16);
+
+  // Body Anthropometrics & Sarcopenia Markers
+  const [waistCm, setWaistCm] = useState(85);
+  const [hipCm, setHipCm] = useState(96);
+  const [muacCm, setMuacCm] = useState(26.5); // Mid-upper arm / bicep
+  const [chestCm, setChestCm] = useState(92);
+
+  // Chronic Conditions
   const [hasDiabetes, setHasDiabetes] = useState(false);
   const [hasHypertension, setHasHypertension] = useState(false);
   const [hasStroke, setHasStroke] = useState(false);
   const [hasHeartDisease, setHasHeartDisease] = useState(false);
+
+  // Functional & Mobility
   const [walkingDiff, setWalkingDiff] = useState(0);
   const [stairsDiff, setStairsDiff] = useState(0);
   const [chairDiff, setChairDiff] = useState(0);
+
+  // Cognition
   const [memoryScore, setMemoryScore] = useState(10);
   const [recallScore, setRecallScore] = useState(10);
+
+  // Medications & Polypharmacy
   const [medCount, setMedCount] = useState(2);
   const [medList, setMedList] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -40,10 +62,19 @@ export const AssessmentFormView: React.FC<AssessmentFormProps> = ({ participant,
     try {
       const payload = {
         participant_id: participant.id,
+        assessment_date: assessmentDate ? new Date(assessmentDate).toISOString() : new Date().toISOString(),
         height_cm: Number(heightCm),
         weight_kg: Number(weightKg),
         systolic_bp: Number(systolicBp),
         diastolic_bp: Number(diastolicBp),
+        pulse_bpm: Number(pulseBpm),
+        spo2_pct: Number(spo2Pct),
+        temperature_c: Number(temperatureC),
+        respiratory_rate: Number(respRate),
+        waist_cm: Number(waistCm),
+        hip_cm: Number(hipCm),
+        mid_upper_arm_circ_cm: Number(muacCm),
+        chest_cm: Number(chestCm),
         has_diabetes: hasDiabetes,
         has_hypertension: hasHypertension,
         has_stroke: hasStroke,
@@ -80,10 +111,88 @@ export const AssessmentFormView: React.FC<AssessmentFormProps> = ({ participant,
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-6">
-        {/* Step 1: Biometrics & Vitals */}
+        {/* Assessment Date Field */}
+        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm flex items-center justify-between">
+          <label className="text-sm font-semibold text-slate-800">{t.assessmentDateLabel}</label>
+          <input
+            type="date"
+            value={assessmentDate}
+            onChange={(e) => setAssessmentDate(e.target.value)}
+            className="px-3 py-1.5 border border-slate-200 rounded-lg text-sm text-slate-700 font-medium"
+          />
+        </div>
+
+        {/* Step 1: Nursing Home Vitals & Hemodynamics */}
         <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
           <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-            <User className="w-4 h-4 text-sky-600" /> Biometrics & Calculated BMI
+            <Gauge className="w-4 h-4 text-sky-600" /> {t.vitalsTitle}
+          </h3>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.systolic}</label>
+              <input
+                type="number"
+                value={systolicBp}
+                onChange={(e) => setSystolicBp(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.diastolic}</label>
+              <input
+                type="number"
+                value={diastolicBp}
+                onChange={(e) => setDiastolicBp(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.pulse}</label>
+              <input
+                type="number"
+                value={pulseBpm}
+                onChange={(e) => setPulseBpm(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.spo2}</label>
+              <input
+                type="number"
+                value={spo2Pct}
+                onChange={(e) => setSpo2Pct(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.temp}</label>
+              <input
+                type="number"
+                step="0.1"
+                value={temperatureC}
+                onChange={(e) => setTemperatureC(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.respRate}</label>
+              <input
+                type="number"
+                value={respRate}
+                onChange={(e) => setRespRate(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Step 2: Body Anthropometrics & Sarcopenia Markers */}
+        <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
+          <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <Ruler className="w-4 h-4 text-amber-600" /> {t.bodyTitle}
           </h3>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <div>
@@ -111,29 +220,53 @@ export const AssessmentFormView: React.FC<AssessmentFormProps> = ({ participant,
               </div>
             </div>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-2">
             <div>
-              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.systolic}</label>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.waist}</label>
               <input
                 type="number"
-                value={systolicBp}
-                onChange={(e) => setSystolicBp(Number(e.target.value))}
+                step="0.5"
+                value={waistCm}
+                onChange={(e) => setWaistCm(Number(e.target.value))}
                 className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.diastolic}</label>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.hip}</label>
               <input
                 type="number"
-                value={diastolicBp}
-                onChange={(e) => setDiastolicBp(Number(e.target.value))}
+                step="0.5"
+                value={hipCm}
+                onChange={(e) => setHipCm(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.muac}</label>
+              <input
+                type="number"
+                step="0.1"
+                value={muacCm}
+                onChange={(e) => setMuacCm(Number(e.target.value))}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+              <span className="text-[10px] text-slate-400">&lt;23 cm flags sarcopenia</span>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase mb-1">{t.chest}</label>
+              <input
+                type="number"
+                step="0.5"
+                value={chestCm}
+                onChange={(e) => setChestCm(Number(e.target.value))}
                 className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
               />
             </div>
           </div>
         </div>
 
-        {/* Step 2: Physical Mobility & ADL Function */}
+        {/* Step 3: Physical Mobility & ADL Function */}
         <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
           <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
             <Activity className="w-4 h-4 text-emerald-600" /> Physical Function & Mobility
@@ -178,7 +311,7 @@ export const AssessmentFormView: React.FC<AssessmentFormProps> = ({ participant,
           </div>
         </div>
 
-        {/* Step 3: Cognition & Memory Reserve */}
+        {/* Step 4: Cognition & Memory Reserve */}
         <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
           <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
             <Brain className="w-4 h-4 text-purple-600" /> Cognitive Function & Memory
@@ -211,7 +344,7 @@ export const AssessmentFormView: React.FC<AssessmentFormProps> = ({ participant,
           </div>
         </div>
 
-        {/* Step 4: Chronic Conditions */}
+        {/* Step 5: Chronic Conditions */}
         <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
           <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
             <Heart className="w-4 h-4 text-rose-600" /> Chronic Disease History
@@ -256,7 +389,7 @@ export const AssessmentFormView: React.FC<AssessmentFormProps> = ({ participant,
           </div>
         </div>
 
-        {/* Step 5: Polypharmacy Review */}
+        {/* Step 6: Polypharmacy Review */}
         <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
           <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
             <Pill className="w-4 h-4 text-amber-600" /> {t.medicationReview}

@@ -62,10 +62,22 @@ class ParticipantResponse(BaseModel):
 # Assessment Input & Response Schemas
 class AssessmentCreate(BaseModel):
     participant_id: str
+    assessment_date: Optional[datetime] = None
     height_cm: Optional[float] = Field(None, ge=50, le=250)
     weight_kg: Optional[float] = Field(None, ge=20, le=300)
     systolic_bp: Optional[float] = Field(None, ge=60, le=260)
     diastolic_bp: Optional[float] = Field(None, ge=40, le=160)
+    pulse_bpm: Optional[float] = Field(None, ge=30, le=220, description="Resting heart rate / pulse in BPM")
+    spo2_pct: Optional[float] = Field(None, ge=50, le=100, description="Oxygen saturation SpO2 %")
+    temperature_c: Optional[float] = Field(None, ge=30, le=45, description="Body temperature in Celsius")
+    respiratory_rate: Optional[float] = Field(None, ge=8, le=60, description="Breaths per minute")
+    
+    # Body Anthropometric Measurements
+    waist_cm: Optional[float] = Field(None, ge=30, le=200, description="Waist circumference in cm")
+    hip_cm: Optional[float] = Field(None, ge=30, le=200, description="Hip circumference in cm")
+    mid_upper_arm_circ_cm: Optional[float] = Field(None, ge=10, le=60, description="Bicep / MUAC circumference in cm")
+    chest_cm: Optional[float] = Field(None, ge=40, le=200, description="Chest circumference in cm")
+    
     has_diabetes: bool = False
     has_hypertension: bool = False
     has_stroke: bool = False
@@ -92,6 +104,15 @@ class AssessmentResponse(BaseModel):
     bmi: Optional[float]
     systolic_bp: Optional[float]
     diastolic_bp: Optional[float]
+    pulse_bpm: Optional[float]
+    spo2_pct: Optional[float]
+    temperature_c: Optional[float]
+    respiratory_rate: Optional[float]
+    waist_cm: Optional[float]
+    hip_cm: Optional[float]
+    mid_upper_arm_circ_cm: Optional[float]
+    chest_cm: Optional[float]
+    
     has_diabetes: bool
     has_hypertension: bool
     has_stroke: bool

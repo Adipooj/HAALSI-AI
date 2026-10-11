@@ -29,6 +29,14 @@ export interface Assessment {
   bmi?: number;
   systolic_bp?: number;
   diastolic_bp?: number;
+  pulse_bpm?: number;
+  spo2_pct?: number;
+  temperature_c?: number;
+  respiratory_rate?: number;
+  waist_cm?: number;
+  hip_cm?: number;
+  mid_upper_arm_circ_cm?: number;
+  chest_cm?: number;
   has_diabetes: boolean;
   has_hypertension: boolean;
   has_stroke: boolean;

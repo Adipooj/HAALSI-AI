@@ -65,6 +65,17 @@ class Assessment(Base):
     bmi = Column(Float, nullable=True)
     systolic_bp = Column(Float, nullable=True)
     diastolic_bp = Column(Float, nullable=True)
+    pulse_bpm = Column(Float, nullable=True)
+    spo2_pct = Column(Float, nullable=True)
+    temperature_c = Column(Float, nullable=True)
+    respiratory_rate = Column(Float, nullable=True)
+    
+    # Body Anthropometric Measurements (Nursing Home / Clinical)
+    waist_cm = Column(Float, nullable=True)
+    hip_cm = Column(Float, nullable=True)
+    mid_upper_arm_circ_cm = Column(Float, nullable=True) # Biceps / MUAC
+    chest_cm = Column(Float, nullable=True)
+    
     has_diabetes = Column(Boolean, default=False)
     has_hypertension = Column(Boolean, default=False)
     has_stroke = Column(Boolean, default=False)

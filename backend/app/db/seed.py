@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta
 from backend.app.db.session import AsyncSessionLocal, engine, Base
 from backend.app.models.entities import Organization, User, Participant, Assessment
 from backend.app.core.security import get_password_hash
@@ -30,131 +31,158 @@ async def seed_data():
         session.add(user)
         await session.flush()
 
-        print("[Seed] Creating Demo Participants & Longitudinal Assessments...")
-        demo_patients = [
-            {
-                "code": "HAALSI-IND-001",
-                "age": 74,
-                "gender": "Female",
-                "phone": "+91 98765 43210",
-                "caregiver": "Rohan Sharma (Son)",
-                "data": {
-                    "height_cm": 156.0,
-                    "weight_kg": 72.0,
-                    "systolic_bp": 145.0,
-                    "diastolic_bp": 88.0,
-                    "has_diabetes": True,
-                    "has_hypertension": True,
-                    "walking_difficulty": 1,
-                    "stairs_difficulty": 2,
-                    "chair_rise_difficulty": 1,
-                    "memory_score": 7.5,
-                    "recall_score": 6.0,
-                    "medications_count": 6,
-                    "medications_list": ["Metformin", "Amlodipine", "Atorvastatin", "Aspirin", "Pantoprazole", "Paracetamol"]
-                }
-            },
-            {
-                "code": "HAALSI-IND-002",
-                "age": 68,
-                "gender": "Male",
-                "phone": "+91 98123 45678",
-                "caregiver": "Ananya Sen (Daughter)",
-                "data": {
-                    "height_cm": 170.0,
-                    "weight_kg": 65.0,
-                    "systolic_bp": 125.0,
-                    "diastolic_bp": 80.0,
-                    "has_diabetes": False,
-                    "has_hypertension": False,
-                    "walking_difficulty": 0,
-                    "stairs_difficulty": 0,
-                    "chair_rise_difficulty": 0,
-                    "memory_score": 10.0,
-                    "recall_score": 9.5,
-                    "medications_count": 1,
-                    "medications_list": ["Multivitamin"]
-                }
-            },
-            {
-                "code": "HAALSI-IND-003",
-                "age": 82,
-                "gender": "Female",
-                "phone": "+91 98345 67890",
-                "caregiver": "Suresh Patel (Husband)",
-                "data": {
-                    "height_cm": 150.0,
-                    "weight_kg": 44.0,
-                    "systolic_bp": 160.0,
-                    "diastolic_bp": 95.0,
-                    "has_diabetes": True,
-                    "has_hypertension": True,
-                    "has_stroke": True,
-                    "walking_difficulty": 2,
-                    "stairs_difficulty": 2,
-                    "chair_rise_difficulty": 2,
-                    "memory_score": 4.5,
-                    "recall_score": 4.0,
-                    "medications_count": 7,
-                    "medications_list": ["Clopidogrel", "Telmisartan", "Hydrochlorothiazide", "Glimepiride", "Metformin", "Donepezil", "Calcium-D3"]
-                }
-            }
-        ]
+        print("[Seed] Creating Longitudinal Nursing Home Patients with Multiple Timepoints...")
+        
+        # Patient 1: Smt. Kamla Devi (76y) tracked across 3 months showing accelerated decline
+        now = datetime.utcnow()
+        p1 = Participant(
+            organization_id=org.id,
+            participant_code="HAALSI-IND-001",
+            age=76,
+            gender="Female",
+            contact_phone="+91 98765 43210",
+            caregiver_name="Rohan Sharma (Son)",
+            caregiver_phone="+91 98765 43210",
+            is_demo=True
+        )
+        session.add(p1)
+        await session.flush()
 
-        for p_info in demo_patients:
-            p = Participant(
-                organization_id=org.id,
-                participant_code=p_info["code"],
-                age=p_info["age"],
-                gender=p_info["gender"],
-                contact_phone=p_info["phone"],
-                caregiver_name=p_info["caregiver"],
-                caregiver_phone=p_info["phone"],
-                is_demo=True
-            )
-            session.add(p)
-            await session.flush()
+        # P1 - Wave 1: 3 months ago (Relatively stable)
+        p1_m1 = {
+            "height_cm": 154.0, "weight_kg": 68.0, "systolic_bp": 132.0, "diastolic_bp": 82.0,
+            "pulse_bpm": 74.0, "spo2_pct": 97.0, "temperature_c": 36.7, "respiratory_rate": 16.0,
+            "waist_cm": 86.0, "hip_cm": 98.0, "mid_upper_arm_circ_cm": 26.5, "chest_cm": 92.0,
+            "has_diabetes": True, "has_hypertension": True,
+            "walking_difficulty": 0, "stairs_difficulty": 1, "chair_rise_difficulty": 0,
+            "memory_score": 9.0, "recall_score": 8.0, "medications_count": 3,
+            "medications_list": ["Metformin", "Amlodipine", "Atorvastatin"]
+        }
+        pred_p1_m1 = ml_service.predict(p1_m1, age=76)
+        a1 = Assessment(
+            participant_id=p1.id, assessor_id=user.id, assessment_date=now - timedelta(days=90),
+            **p1_m1, **{k: v for k, v in pred_p1_m1.items() if k != "is_polypharmacy"},
+            is_polypharmacy=pred_p1_m1["is_polypharmacy"]
+        )
+        session.add(a1)
 
-            # Predict and create assessment
-            pred = ml_service.predict(p_info["data"], age=p_info["age"])
-            d = p_info["data"]
-            
-            a = Assessment(
-                participant_id=p.id,
-                assessor_id=user.id,
-                height_cm=d["height_cm"],
-                weight_kg=d["weight_kg"],
-                bmi=pred["bmi"],
-                systolic_bp=d["systolic_bp"],
-                diastolic_bp=d["diastolic_bp"],
-                has_diabetes=d["has_diabetes"],
-                has_hypertension=d["has_hypertension"],
-                has_stroke=d.get("has_stroke", False),
-                has_heart_disease=d.get("has_heart_disease", False),
-                walking_difficulty=d["walking_difficulty"],
-                stairs_difficulty=d["stairs_difficulty"],
-                chair_rise_difficulty=d["chair_rise_difficulty"],
-                memory_score=d["memory_score"],
-                recall_score=d["recall_score"],
-                medications_count=d["medications_count"],
-                medications_list=d["medications_list"],
-                is_polypharmacy=pred["is_polypharmacy"],
-                frailty_index=pred["frailty_index"],
-                decline_probability=pred["decline_probability"],
-                trajectory_score=pred["trajectory_score"],
-                trajectory_category=pred["trajectory_category"],
-                overall_risk_score=pred["overall_risk_score"],
-                risk_tier=pred["risk_tier"],
-                estimated_years_to_independence_loss=pred["estimated_years_to_independence_loss"],
-                model_version=pred["model_version"],
-                schema_version=pred["schema_version"],
-                shap_contributions=pred["shap_contributions"],
-                clinical_recommendations=pred["clinical_recommendations"]
-            )
-            session.add(a)
+        # P1 - Wave 2: 1.5 months ago (Moderate decline after fall)
+        p1_m2 = {
+            "height_cm": 154.0, "weight_kg": 64.5, "systolic_bp": 142.0, "diastolic_bp": 88.0,
+            "pulse_bpm": 82.0, "spo2_pct": 95.0, "temperature_c": 36.8, "respiratory_rate": 18.0,
+            "waist_cm": 84.0, "hip_cm": 96.0, "mid_upper_arm_circ_cm": 24.8, "chest_cm": 90.0,
+            "has_diabetes": True, "has_hypertension": True,
+            "walking_difficulty": 1, "stairs_difficulty": 2, "chair_rise_difficulty": 1,
+            "memory_score": 7.5, "recall_score": 6.5, "medications_count": 5,
+            "medications_list": ["Metformin", "Amlodipine", "Atorvastatin", "Aspirin", "Pantoprazole"]
+        }
+        pred_p1_m2 = ml_service.predict(p1_m2, age=76)
+        a2 = Assessment(
+            participant_id=p1.id, assessor_id=user.id, assessment_date=now - timedelta(days=45),
+            **p1_m2, **{k: v for k, v in pred_p1_m2.items() if k != "is_polypharmacy"},
+            is_polypharmacy=pred_p1_m2["is_polypharmacy"]
+        )
+        session.add(a2)
+
+        # P1 - Wave 3: Current assessment (High risk / rapid decline)
+        p1_m3 = {
+            "height_cm": 154.0, "weight_kg": 61.0, "systolic_bp": 155.0, "diastolic_bp": 94.0,
+            "pulse_bpm": 88.0, "spo2_pct": 93.0, "temperature_c": 37.1, "respiratory_rate": 20.0,
+            "waist_cm": 82.0, "hip_cm": 93.0, "mid_upper_arm_circ_cm": 22.2, "chest_cm": 88.0,
+            "has_diabetes": True, "has_hypertension": True, "has_heart_disease": True,
+            "walking_difficulty": 2, "stairs_difficulty": 2, "chair_rise_difficulty": 2,
+            "memory_score": 6.0, "recall_score": 5.0, "medications_count": 7,
+            "medications_list": ["Metformin", "Amlodipine", "Atorvastatin", "Aspirin", "Pantoprazole", "Torsemide", "Paracetamol"]
+        }
+        pred_p1_m3 = ml_service.predict(p1_m3, age=76)
+        a3 = Assessment(
+            participant_id=p1.id, assessor_id=user.id, assessment_date=now - timedelta(days=2),
+            **p1_m3, **{k: v for k, v in pred_p1_m3.items() if k != "is_polypharmacy"},
+            is_polypharmacy=pred_p1_m3["is_polypharmacy"]
+        )
+        session.add(a3)
+
+        # Patient 2: Shri Ramesh Sen (68y) stable longitudinal trajectory over 2 months
+        p2 = Participant(
+            organization_id=org.id,
+            participant_code="HAALSI-IND-002",
+            age=68,
+            gender="Male",
+            contact_phone="+91 98123 45678",
+            caregiver_name="Ananya Sen (Daughter)",
+            caregiver_phone="+91 98123 45678",
+            is_demo=True
+        )
+        session.add(p2)
+        await session.flush()
+
+        p2_m1 = {
+            "height_cm": 170.0, "weight_kg": 66.0, "systolic_bp": 124.0, "diastolic_bp": 78.0,
+            "pulse_bpm": 70.0, "spo2_pct": 98.0, "temperature_c": 36.6, "respiratory_rate": 15.0,
+            "waist_cm": 88.0, "hip_cm": 96.0, "mid_upper_arm_circ_cm": 28.0, "chest_cm": 96.0,
+            "has_diabetes": False, "has_hypertension": False,
+            "walking_difficulty": 0, "stairs_difficulty": 0, "chair_rise_difficulty": 0,
+            "memory_score": 10.0, "recall_score": 9.5, "medications_count": 1,
+            "medications_list": ["Multivitamin"]
+        }
+        pred_p2_m1 = ml_service.predict(p2_m1, age=68)
+        b1 = Assessment(
+            participant_id=p2.id, assessor_id=user.id, assessment_date=now - timedelta(days=60),
+            **p2_m1, **{k: v for k, v in pred_p2_m1.items() if k != "is_polypharmacy"},
+            is_polypharmacy=pred_p2_m1["is_polypharmacy"]
+        )
+        session.add(b1)
+
+        p2_m2 = {
+            "height_cm": 170.0, "weight_kg": 66.5, "systolic_bp": 122.0, "diastolic_bp": 76.0,
+            "pulse_bpm": 68.0, "spo2_pct": 98.0, "temperature_c": 36.5, "respiratory_rate": 14.0,
+            "waist_cm": 87.5, "hip_cm": 96.0, "mid_upper_arm_circ_cm": 28.2, "chest_cm": 96.0,
+            "has_diabetes": False, "has_hypertension": False,
+            "walking_difficulty": 0, "stairs_difficulty": 0, "chair_rise_difficulty": 0,
+            "memory_score": 10.0, "recall_score": 9.5, "medications_count": 1,
+            "medications_list": ["Multivitamin"]
+        }
+        pred_p2_m2 = ml_service.predict(p2_m2, age=68)
+        b2 = Assessment(
+            participant_id=p2.id, assessor_id=user.id, assessment_date=now - timedelta(days=5),
+            **p2_m2, **{k: v for k, v in pred_p2_m2.items() if k != "is_polypharmacy"},
+            is_polypharmacy=pred_p2_m2["is_polypharmacy"]
+        )
+        session.add(b2)
+
+        # Patient 3: Smt. Meena Patel (82y)
+        p3 = Participant(
+            organization_id=org.id,
+            participant_code="HAALSI-IND-003",
+            age=82,
+            gender="Female",
+            contact_phone="+91 98345 67890",
+            caregiver_name="Suresh Patel (Husband)",
+            caregiver_phone="+91 98345 67890",
+            is_demo=True
+        )
+        session.add(p3)
+        await session.flush()
+
+        p3_m1 = {
+            "height_cm": 150.0, "weight_kg": 44.0, "systolic_bp": 158.0, "diastolic_bp": 94.0,
+            "pulse_bpm": 86.0, "spo2_pct": 94.0, "temperature_c": 36.8, "respiratory_rate": 18.0,
+            "waist_cm": 78.0, "hip_cm": 88.0, "mid_upper_arm_circ_cm": 21.0, "chest_cm": 82.0,
+            "has_diabetes": True, "has_hypertension": True, "has_stroke": True,
+            "walking_difficulty": 2, "stairs_difficulty": 2, "chair_rise_difficulty": 2,
+            "memory_score": 4.5, "recall_score": 4.0, "medications_count": 7,
+            "medications_list": ["Clopidogrel", "Telmisartan", "Hydrochlorothiazide", "Glimepiride", "Metformin", "Donepezil", "Calcium-D3"]
+        }
+        pred_p3_m1 = ml_service.predict(p3_m1, age=82)
+        c1 = Assessment(
+            participant_id=p3.id, assessor_id=user.id, assessment_date=now - timedelta(days=1),
+            **p3_m1, **{k: v for k, v in pred_p3_m1.items() if k != "is_polypharmacy"},
+            is_polypharmacy=pred_p3_m1["is_polypharmacy"]
+        )
+        session.add(c1)
 
         await session.commit()
-        print("[Seed] Seed data successfully generated!")
+        print("[Seed] Longitudinal multi-wave seed data generated successfully!")
 
 if __name__ == "__main__":
     asyncio.run(seed_data())

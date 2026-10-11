@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -33,11 +34,20 @@ async def create_assessment(
     assessment = Assessment(
         participant_id=participant.id,
         assessor_id=current_user.id,
+        assessment_date=assessment_in.assessment_date or datetime.utcnow(),
         height_cm=assessment_in.height_cm,
         weight_kg=assessment_in.weight_kg,
         bmi=ml_output["bmi"],
         systolic_bp=assessment_in.systolic_bp,
         diastolic_bp=assessment_in.diastolic_bp,
+        pulse_bpm=assessment_in.pulse_bpm,
+        spo2_pct=assessment_in.spo2_pct,
+        temperature_c=assessment_in.temperature_c,
+        respiratory_rate=assessment_in.respiratory_rate,
+        waist_cm=assessment_in.waist_cm,
+        hip_cm=assessment_in.hip_cm,
+        mid_upper_arm_circ_cm=assessment_in.mid_upper_arm_circ_cm,
+        chest_cm=assessment_in.chest_cm,
         has_diabetes=assessment_in.has_diabetes,
         has_hypertension=assessment_in.has_hypertension,
         has_stroke=assessment_in.has_stroke,
