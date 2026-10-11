@@ -1,0 +1,2264 @@
+================================================================================
+FILE: app.py
+================================================================================
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import joblib
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+from config.haalsi_config import FEATURE_COLUMNS_FILE, FEATURE_DEFAULTS_FILE, MODEL_FILE, SCHEMA_FILE
+from inference.input_mapper import align_frame_to_schema, map_user_inputs_to_frame
+from inference.schema import SchemaArtifact
+
+# Set layout
+st.set_page_config(page_title="HAALSI Geriatric Risk Engine", layout="wide")
+
+# Add premium styling and fonts
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Outfit', sans-serif;
+}
+
+.stButton>button {
+    background: linear-gradient(135deg, #6200EE, #8C3BFF);
+    color: white;
+    border-radius: 8px;
+    padding: 10px 24px;
+    font-weight: 600;
+    border: none;
+    box-shadow: 0 4px 12px rgba(98, 0, 238, 0.3);
+    transition: all 0.3s ease;
+}
+.stButton>button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(98, 0, 238, 0.4);
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("HAALSI Explainable Geriatric Risk Engine")
+st.write("An advanced predictive system for decline probability, multi-domain health trajectory score, and time-to-loss-of-independence prediction.")
+
+# Load models and schemas
+decline_model_path = MODEL_FILE.parent / "decline_model.joblib"
+trajectory_model_path = MODEL_FILE.parent / "trajectory_model.joblib"
+trajectory_scaler_path = MODEL_FILE.parent / "trajectory_scaler.joblib"
+thresholds_path = MODEL_FILE.parent / "trajectory_thresholds.json"
+
+if (not decline_model_path.exists() or 
+    not trajectory_model_path.exists() or 
+    not trajectory_scaler_path.exists() or 
+    not thresholds_path.exists() or 
+    not SCHEMA_FILE.exists()):
+    st.warning("Model artifacts not found. Run `python main.py` first.")
+    st.stop()
+
+decline_model = joblib.load(decline_model_path)
+trajectory_model = joblib.load(trajectory_model_path)
+trajectory_scaler = joblib.load(trajectory_scaler_path)
+schema = SchemaArtifact.load(SCHEMA_FILE)
+
+defaults = schema.feature_defaults
+feature_columns = schema.feature_columns
+
+# Load thresholds
+with open(thresholds_path, "r", encoding="utf-8") as f:
+    thresholds = json.load(f)
+
+# Helper function to classify domain groups
+def get_domain_group(col: str) -> str:
+    c = col.lower()
+    if any(k in c for k in ["walk", "stairs", "chair", "grip", "mobility"]):
+        return "mobility"
+    elif any(k in c for k in ["bp", "pressure", "systolic", "diabetes", "stroke", "heart", "hiv", "cd4", "disease"]):
+        return "disease"
+    elif any(k in c for k in ["bmi", "weight", "height"]):
+        return "bmi"
+    elif any(k in c for k in ["memory", "recall", "cog", "depress", "sad", "social", "friend", "cognition"]):
+        return "cognition"
+    else:
+        return "other"
+
+# Separate raw features from computed features
+computed_cols = ["global_mean", "global_missing", "health_index", "frailty_index"]
+raw_cols = []
+for col in feature_columns:
+    is_computed = (
+        col in computed_cols or
+        col.endswith("_mean") or
+        col.endswith("_std") or
+        col.endswith("_missing_frac") or
+        col.endswith("_impairment") or
+        col.endswith("_count")
+    )
+    if not is_computed:
+        raw_cols.append(col)
+
+# Group raw features
+mobility_cols = []
+disease_cols = []
+bmi_cols = []
+cognition_cols = []
+other_cols = []
+
+for col in raw_cols:
+    group = get_domain_group(col)
+    if group == "mobility":
+        mobility_cols.append(col)
+    elif group == "disease":
+        disease_cols.append(col)
+    elif group == "bmi":
+        bmi_cols.append(col)
+    elif group == "cognition":
+        cognition_cols.append(col)
+    else:
+        other_cols.append(col)
+
+# Helper function to compute computed features
+def fill_computed_features(df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    
+    domain_map = {}
+    for col in feature_columns:
+        if "__" in col:
+            domain = col.split("__")[0]
+            domain_map.setdefault(domain, []).append(col)
+            
+    for d, cols in domain_map.items():
+        block = df[cols].apply(pd.to_numeric, errors="coerce")
+        df[f"{d}_mean"] = block.mean(axis=1)
+        if f"{d}_std" in feature_columns:
+            df[f"{d}_std"] = block.std(axis=1) if len(cols) > 1 else 0.0
+        df[f"{d}_missing_frac"] = block.isna().mean(axis=1)
+        
+        row_median = block.median(axis=1).iloc[0]
+        if pd.isna(row_median):
+            df[f"{d}_impairment"] = 0
+        else:
+            df[f"{d}_impairment"] = (block.mean(axis=1) < row_median).astype(int)
+        df[f"{d}_count"] = block.notna().sum(axis=1)
+        
+    df["global_mean"] = df[raw_cols].mean(axis=1)
+    df["global_missing"] = df[raw_cols].isna().mean(axis=1)
+    global_std = df[raw_cols].std(axis=1)
+    df["health_index"] = df["global_mean"] / (1 + global_std)
+    
+    from features.frailty_index import compute_frailty_index
+    df["frailty_index"] = compute_frailty_index(df)
+    
+    df = df[feature_columns]
+    return df
+
+# Helper function to render metric cards
+def render_metric_card(title: str, value: str, subtitle: str = "", bg_color: str = "#1E1E2F", text_color: str = "#FFFFFF"):
+    return f"""
+    <div style="background-color: {bg_color}; padding: 20px; border-radius: 12px; border: 1px solid #3A3A5A; margin: 10px 0; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);">
+        <h4 style="margin: 0; color: #8C8CAB; font-size: 13px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;">{title}</h4>
+        <div style="margin: 8px 0 0 0; color: {text_color}; font-size: 28px; font-weight: 700; font-family: 'Outfit', sans-serif;">{value}</div>
+        {f'<div style="margin-top: 4px; color: #A0A0C0; font-size: 11px;">{subtitle}</div>' if subtitle else ''}
+    </div>
+    """
+
+# Sidebar / main area inputs layout
+st.write("### 📋 Patient Inputs")
+st.write("Fill in the fields below. Clear an input to leave it blank (imputed using cohort median).")
+
+user_inputs = {}
+
+col1, col2 = st.columns(2)
+
+with col1:
+    with st.expander("🏃 Mobility & Physical Function", expanded=True):
+        for col in mobility_cols:
+            med = defaults.get(col, 0.0)
+            user_inputs[col] = st.number_input(
+                col.split("__")[-1], 
+                value=None, 
+                placeholder=f"Median: {med:.2f}",
+                key=f"input_{col}"
+            )
+            
+    with st.expander("🧠 Cognition, Mental Health & Social", expanded=True):
+        for col in cognition_cols:
+            med = defaults.get(col, 0.0)
+            user_inputs[col] = st.number_input(
+                col.split("__")[-1], 
+                value=None, 
+                placeholder=f"Median: {med:.2f}",
+                key=f"input_{col}"
+            )
+
+with col2:
+    with st.expander("🩺 Chronic Diseases & Medical History", expanded=True):
+        for col in disease_cols:
+            med = defaults.get(col, 0.0)
+            user_inputs[col] = st.number_input(
+                col.split("__")[-1], 
+                value=None, 
+                placeholder=f"Median: {med:.2f}",
+                key=f"input_{col}"
+            )
+            
+    with st.expander("⚖️ BMI & Anthropometric Measurements", expanded=True):
+        for col in bmi_cols:
+            med = defaults.get(col, 0.0)
+            user_inputs[col] = st.number_input(
+                col.split("__")[-1], 
+                value=None, 
+                placeholder=f"Median: {med:.2f}",
+                key=f"input_{col}"
+            )
+            
+    with st.expander("👤 Demographics & Other Metrics", expanded=True):
+        for col in other_cols:
+            med = defaults.get(col, 0.0)
+            user_inputs[col] = st.number_input(
+                col, 
+                value=None, 
+                placeholder=f"Median: {med:.2f}",
+                key=f"input_{col}"
+            )
+
+# Fill other computed cols with None
+for col in feature_columns:
+    if col not in user_inputs:
+        user_inputs[col] = None
+
+# Scoring action
+if st.button("Calculate Patient Risk"):
+    # 1. Map to input dataframe
+    input_df = map_user_inputs_to_frame(user_inputs, feature_columns, defaults)
+    input_df = align_frame_to_schema(input_df, feature_columns, defaults)
+    
+    # 2. Compute missing fraction (only over raw input fields)
+    missing_count = sum(pd.isna(input_df.loc[0, col]) for col in raw_cols)
+    total_features = len(raw_cols)
+    missing_fraction = missing_count / total_features
+    
+    # 3. Dynamic fill of computed features
+    input_df = fill_computed_features(input_df, feature_columns)
+    
+    # 4. Fallback median imputation
+    for col in feature_columns:
+        if pd.isna(input_df.loc[0, col]):
+            input_df.loc[0, col] = defaults.get(col, 0.0)
+            
+    # 5. Predict Decline Probability (Calibrated)
+    decline_prob = decline_model.predict_proba(input_df)[0, 1]
+    
+    # 6. Predict Trajectory Score
+    traj_raw = trajectory_model.predict(input_df)[0]
+    
+    # 7. Apply Trajectory Scaler
+    traj_scaled = trajectory_scaler.transform(np.array([[traj_raw]]))[0, 0]
+    
+    # 8. Compute Combined Risk
+    combined = 0.5 * decline_prob + 0.5 * traj_scaled
+    
+    # 9. Trajectory classification
+    if traj_scaled < thresholds["scaled_lower"]:
+        traj_class = "Stable"
+    elif traj_scaled <= thresholds["scaled_upper"]:
+        traj_class = "Moderate decline"
+    else:
+        traj_class = "Rapid decline"
+        
+    # 10. Estimate Time to Loss of Independence
+    from simulation.time_to_event import estimate_time_to_independence_loss
+    
+    frailty = pd.Series([float(input_df.loc[0, "frailty_index"])])
+    age = pd.Series([float(input_df.loc[0, "age_proxy"]) if "age_proxy" in input_df.columns else 65.0])
+    
+    years_to_independence_loss = estimate_time_to_independence_loss(
+        base_features=input_df,
+        decline_model=decline_model,
+        frailty=frailty,
+        age=age,
+        threshold=0.75
+    )
+    
+    # 11. Risk category
+    from models.risk_fusion import categorize_risk
+    risk_cat = categorize_risk(pd.Series([combined])).iloc[0]
+    
+    # Render UI outputs
+    st.write("---")
+    st.write("## 📊 Clinical Analysis Results")
+    
+    # Confidence Indicator
+    if missing_fraction <= 0.2:
+        conf_label = "High Confidence"
+        conf_color = "#10B981"
+        conf_bg = "#D1FAE5"
+        conf_text = "#065F46"
+    elif missing_fraction <= 0.6:
+        conf_label = "Moderate Confidence"
+        conf_color = "#F59E0B"
+        conf_bg = "#FEF3C7"
+        conf_text = "#92400E"
+    else:
+        conf_label = "Low Confidence"
+        conf_color = "#EF4444"
+        conf_bg = "#FEE2E2"
+        conf_text = "#991B1B"
+        st.warning("⚠️ Low confidence prediction due to missing data")
+        
+    st.markdown(f"""
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
+        <span style="font-weight: 600; color: #4A4A6A;">Prediction Confidence:</span>
+        <span style="background-color: {conf_bg}; color: {conf_text}; border: 1px solid {conf_color}; padding: 4px 12px; border-radius: 20px; font-weight: 600; font-size: 14px;">
+            ● {conf_label} ({ (1 - missing_fraction)*100 :.1f}% inputs provided)
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col_out1, col_out2, col_out3 = st.columns(3)
+    
+    with col_out1:
+        st.markdown(render_metric_card(
+            "Decline Probability", 
+            f"{decline_prob:.1%}", 
+            "Likelihood of functional decline (W1 → W2)",
+            bg_color="#1E1E2F",
+            text_color="#FFFFFF"
+        ), unsafe_allow_html=True)
+        
+        st.markdown(render_metric_card(
+            "Combined Risk", 
+            f"{combined:.1%}", 
+            "Overall geriatric health trajectory risk",
+            bg_color="#2E1E3F",
+            text_color="#C084FC"
+        ), unsafe_allow_html=True)
+        
+    with col_out2:
+        st.markdown(render_metric_card(
+            "Trajectory Score", 
+            f"{traj_raw:.3f}", 
+            f"Cohort Percentile: {traj_scaled:.1%}",
+            bg_color="#1E1E2F",
+            text_color="#FFFFFF"
+        ), unsafe_allow_html=True)
+        
+        st.markdown(render_metric_card(
+            "Time to Loss of Independence", 
+            f"{years_to_independence_loss} yrs" if isinstance(years_to_independence_loss, (int, float)) else str(years_to_independence_loss), 
+            "Estimated years until high-risk threshold reached",
+            bg_color="#1E2F2F",
+            text_color="#2DD4BF"
+        ), unsafe_allow_html=True)
+        
+    with col_out3:
+        st.markdown(render_metric_card(
+            "Trajectory Class", 
+            traj_class, 
+            "Stable / Moderate / Rapid decline classification",
+            bg_color="#1E1E2F",
+            text_color="#60A5FA"
+        ), unsafe_allow_html=True)
+        
+        st.markdown(render_metric_card(
+            "Risk Category", 
+            risk_cat, 
+            "Fused combined risk severity rating",
+            bg_color="#1E1E2F",
+            text_color="#34D399"
+        ), unsafe_allow_html=True)
+        
+    # Explainability (SHAP)
+    st.write("---")
+    st.write("### 🔍 Top Risk Drivers (SHAP Explanation)")
+    
+    from explainability.shap_explainer import explain_decline
+    try:
+        top_10, contributions = explain_decline(decline_model, input_df)
+        
+        # Sort contributions by absolute value
+        sorted_contributions = sorted(contributions.items(), key=lambda item: abs(item[1]), reverse=True)[:10]
+        
+        shap_html = "<div style='background-color: #1E1E2F; padding: 25px; border-radius: 12px; border: 1px solid #3A3A5A;'>"
+        for feature, val in sorted_contributions:
+            max_val = max(abs(v) for f, v in sorted_contributions) or 1.0
+            pct = (abs(val) / max_val) * 100
+            
+            bar_color = "#EF4444" if val > 0 else "#10B981"
+            direction = "Increases Risk" if val > 0 else "Decreases Risk"
+            
+            clean_name = feature.split("__")[-1]
+            
+            shap_html += f"""
+            <div style='margin-bottom: 15px;'>
+                <div style='display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 4px; color: #FFFFFF;'>
+                    <span style='font-weight: 500;'>{clean_name} <small style='color: #8C8CAB;'>({feature})</small></span>
+                    <span style='color: {bar_color}; font-weight: 600;'>{val:+.4f} ({direction})</span>
+                </div>
+                <div style='background-color: #3A3A5A; border-radius: 4px; height: 10px; width: 100%;'>
+                    <div style='background-color: {bar_color}; height: 10px; border-radius: 4px; width: {pct:.1f}%;'></div>
+                </div>
+            </div>
+            """
+        shap_html += "</div>"
+        st.markdown(shap_html, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Could not compute SHAP explanations: {e}")
+
+================================================================================
+FILE: main.py
+================================================================================
+
+from pipeline.train_pipeline import run_training
+
+if __name__ == "__main__":
+    run_training()
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+xgboost>=2.0
+joblib>=1.3
+openpyxl>=3.1
+pyreadstat>=1.2
+shap>=0.45
+streamlit>=1.33
+pyarrow>=15.0
+
+================================================================================
+FILE: config/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: config/haalsi_config.py
+================================================================================
+
+from pathlib import Path
+
+# Absolute source paths you provided
+DATA_PATH = Path(r"T:\HAALSI\ICPSR_36633\DS0001\36633-0001-Data.dta")
+CROSSWALK_PATH = Path(r"T:\HAALSI\ICPSR_36633\DS0001\36633-0001-Documentation-crosswalk.xlsx")
+
+# Project-local paths
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
+MODEL_DIR = OUTPUT_DIR / "models"
+ARTIFACT_DIR = OUTPUT_DIR / "artifacts"
+REPORT_DIR = OUTPUT_DIR / "reports"
+
+WAVES = ("W1", "W2", "W3")
+MISSING_VALUES = (-97, -98, -99)
+
+# Conservative defaults for the first implementation
+TARGET_WAVE_PAIR = ("W1", "W2")
+RANDOM_STATE = 42
+
+# Risk fusion weights; retrain/recalibrate later if needed
+FRAILTY_WEIGHT = 0.40
+DECLINE_WEIGHT = 0.40
+AGE_WEIGHT = 0.20
+
+# Core outputs
+MODEL_FILE = MODEL_DIR / "haalsi_decline_model.joblib"
+CALIBRATOR_FILE = MODEL_DIR / "haalsi_calibrator.joblib"
+FEATURE_COLUMNS_FILE = ARTIFACT_DIR / "feature_columns.json"
+FEATURE_DEFAULTS_FILE = ARTIFACT_DIR / "feature_defaults.json"
+SCHEMA_FILE = ARTIFACT_DIR / "schema.json"
+CROSSWALK_CACHE_FILE = ARTIFACT_DIR / "crosswalk_cache.parquet"
+
+================================================================================
+FILE: data/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: data/loader.py
+================================================================================
+
+from __future__ import annotations
+
+from pathlib import Path
+import pandas as pd
+
+from config.haalsi_config import DATA_PATH
+
+
+def load_haalsi_data(path: str | Path = DATA_PATH) -> pd.DataFrame:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Data file not found: {path}")
+
+    df = pd.read_stata(path, convert_categoricals=False, preserve_dtypes=True)
+    print(f"[loader] Loaded HAALSI data: {df.shape[0]:,} rows × {df.shape[1]:,} columns")
+    return df
+
+================================================================================
+FILE: data/preprocessing.py
+================================================================================
+
+from __future__ import annotations
+
+from typing import Iterable
+import numpy as np
+import pandas as pd
+
+from config.haalsi_config import MISSING_VALUES
+
+
+def clean_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Safe replacement of HAALSI missing codes (-97, -98, -99)
+    avoiding pandas block corruption
+    """
+
+    out = df.copy()
+
+    for col in out.columns:
+        try:
+            out[col] = out[col].replace(MISSING_VALUES, np.nan)
+        except Exception:
+            continue
+
+    return out
+
+
+def standardize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def safe_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+def binary_from_any(series: pd.Series) -> pd.Series:
+    s = safe_numeric(series)
+    return (s > 0).astype("float64")
+
+
+def clip_percentile(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
+    s = safe_numeric(series)
+    lo, hi = s.quantile([lower, upper])
+    return s.clip(lo, hi)
+
+================================================================================
+FILE: data/wave_parser.py
+================================================================================
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Dict, List
+import pandas as pd
+
+
+def get_wave_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
+    wave_cols = defaultdict(list)
+    for col in df.columns:
+        s = str(col)
+        if s.startswith("W1"):
+            wave_cols["W1"].append(s)
+        elif s.startswith("W2"):
+            wave_cols["W2"].append(s)
+        elif s.startswith("W3"):
+            wave_cols["W3"].append(s)
+    return dict(wave_cols)
+
+
+def split_by_wave(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    cols = get_wave_columns(df)
+    return {wave: df[wave_cols].copy() for wave, wave_cols in cols.items()}
+
+
+def get_panel_pairs(df: pd.DataFrame, base_wave: str = "W1", follow_wave: str = "W2") -> tuple[pd.DataFrame, pd.DataFrame]:
+    base_cols = [c for c in df.columns if str(c).startswith(base_wave)]
+    follow_cols = [c for c in df.columns if str(c).startswith(follow_wave)]
+    return df[base_cols].copy(), df[follow_cols].copy()
+
+================================================================================
+FILE: explainability/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: explainability/shap_explainer.py
+================================================================================
+
+from __future__ import annotations
+
+from typing import Any
+import numpy as np
+import pandas as pd
+import shap
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.pipeline import Pipeline
+
+
+def explain_decline(model: Any, X: pd.DataFrame) -> tuple[list[str], dict[str, float]]:
+    """
+    Computes SHAP values for the decline model.
+    Handles CalibratedClassifierCV (averaging over folds) and direct Pipeline estimators.
+    
+    Returns:
+        - top_10_features: list of the top 10 features by mean absolute SHAP value.
+        - feature_contributions: dictionary of feature names to their SHAP values for the first sample.
+    """
+    if isinstance(model, CalibratedClassifierCV):
+        all_shap_values = []
+        for calibrated_classifier in model.calibrated_classifiers_:
+            estimator = calibrated_classifier.estimator  # Pipeline
+            
+            # Preprocess features
+            preprocessor = Pipeline(estimator.steps[:-1])
+            X_trans = preprocessor.transform(X)
+            X_trans_df = pd.DataFrame(X_trans, columns=X.columns)
+            
+            clf = estimator.steps[-1][1]  # XGBClassifier
+            explainer = shap.TreeExplainer(clf)
+            exp = explainer(X_trans_df)
+            shap_vals = exp.values
+            
+            # Handle binary class dimension
+            if shap_vals.ndim == 3:
+                shap_vals = shap_vals[:, :, 1]
+            all_shap_values.append(shap_vals)
+            
+        mean_shap_values = np.mean(all_shap_values, axis=0)
+    else:
+        # Direct Pipeline or base estimator
+        estimator = model
+        preprocessor = Pipeline(estimator.steps[:-1])
+        X_trans = preprocessor.transform(X)
+        X_trans_df = pd.DataFrame(X_trans, columns=X.columns)
+        
+        clf = estimator.steps[-1][1]
+        explainer = shap.TreeExplainer(clf)
+        exp = explainer(X_trans_df)
+        mean_shap_values = exp.values
+        if mean_shap_values.ndim == 3:
+            mean_shap_values = mean_shap_values[:, :, 1]
+
+    # Mean absolute SHAP values across the batch
+    mean_abs_shap = np.mean(np.abs(mean_shap_values), axis=0)
+    feature_importance = pd.Series(mean_abs_shap, index=X.columns)
+    top_10_features = feature_importance.sort_values(ascending=False).head(10).index.tolist()
+    
+    # Feature contributions for the first row
+    first_sample_shap = mean_shap_values[0]
+    feature_contributions = dict(zip(X.columns, first_sample_shap))
+    
+    return top_10_features, feature_contributions
+
+
+================================================================================
+FILE: features/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: features/crosswalk.py
+================================================================================
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from config.haalsi_config import CROSSWALK_PATH
+
+
+def _normalize_col(col: Any) -> str:
+    return re.sub(r"\s+", " ", str(col).strip().lower())
+
+
+def load_crosswalk(path: str | Path = CROSSWALK_PATH) -> pd.DataFrame:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Crosswalk file not found: {path}")
+
+    xls = pd.ExcelFile(path)
+    frames = []
+
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(path, sheet_name=sheet)
+        if df.empty:
+            continue
+        df = df.copy()
+        df.columns = [_normalize_col(c) for c in df.columns]
+        df["source_sheet"] = sheet
+        frames.append(df)
+
+    if not frames:
+        raise ValueError(f"No readable sheets found in crosswalk: {path}")
+
+    crosswalk = pd.concat(frames, ignore_index=True)
+    crosswalk = crosswalk.dropna(how="all")
+    return crosswalk
+
+
+def guess_columns(crosswalk: pd.DataFrame) -> dict[str, str | None]:
+    cols = list(crosswalk.columns)
+
+    def find_contains(tokens: list[str]) -> str | None:
+        for c in cols:
+            cc = c.lower()
+            if all(t in cc for t in tokens):
+                return c
+        return None
+
+    return {
+        "w1": find_contains(["wave", "1"]) or find_contains(["w1"]) or find_contains(["wave 1"]),
+        "w2": find_contains(["wave", "2"]) or find_contains(["w2"]) or find_contains(["wave 2"]),
+        "w3": find_contains(["wave", "3"]) or find_contains(["w3"]) or find_contains(["wave 3"]),
+        "question": find_contains(["question", "text"]) or find_contains(["question"]),
+        "label": find_contains(["label"]),
+        "concept": find_contains(["concept"]) or find_contains(["topic"]),
+        "varname": find_contains(["varname"]) or find_contains(["variable", "name"]),
+    }
+
+
+def clean_crosswalk(crosswalk: pd.DataFrame) -> pd.DataFrame:
+    out = crosswalk.copy()
+    out.columns = [_normalize_col(c) for c in out.columns]
+    out = out.dropna(how="all")
+    return out
+
+
+def build_variable_registry(crosswalk: pd.DataFrame) -> pd.DataFrame:
+    crosswalk = clean_crosswalk(crosswalk)
+    cols = guess_columns(crosswalk)
+
+    if cols["varname"] is None and cols["question"] is None:
+        raise ValueError(
+            "Could not detect the expected crosswalk columns. "
+            "Inspect the workbook and update `guess_columns()`."
+        )
+
+    out = crosswalk.copy()
+
+    if cols["question"] is None:
+        out["question_text"] = ""
+    else:
+        out["question_text"] = out[cols["question"]].fillna("").astype(str)
+
+    if cols["label"] is None:
+        out["label_text"] = ""
+    else:
+        out["label_text"] = out[cols["label"]].fillna("").astype(str)
+
+    if cols["concept"] is None:
+        out["concept_text"] = ""
+    else:
+        out["concept_text"] = out[cols["concept"]].fillna("").astype(str)
+
+    if cols["varname"] is None:
+        out["varname_text"] = ""
+    else:
+        out["varname_text"] = out[cols["varname"]].fillna("").astype(str)
+
+    # Keep a single searchable text field
+    out["search_text"] = (
+        out["question_text"].fillna("") + " " +
+        out["label_text"].fillna("") + " " +
+        out["concept_text"].fillna("") + " " +
+        out["varname_text"].fillna("")
+    ).str.lower()
+
+    return out
+
+================================================================================
+FILE: features/feature_builder.py
+================================================================================
+
+from __future__ import annotations
+
+import pandas as pd
+import numpy as np
+
+
+# ---------------------------
+# DOMAIN DETECTION (KEY FIX)
+# ---------------------------
+
+def detect_domain(col: str) -> str | None:
+    c = col.lower()
+
+    if "walk" in c or "stairs" in c or "chair" in c:
+        return "mobility"
+    elif "grip" in c:
+        return "grip"
+    elif "bp" in c or "pressure" in c or "systolic" in c:
+        return "blood_pressure"
+    elif "bmi" in c or "weight" in c or "height" in c:
+        return "bmi"
+    elif "diabetes" in c or "stroke" in c or "heart" in c:
+        return "disease"
+    elif "hiv" in c or "cd4" in c:
+        return "hiv"
+    elif "memory" in c or "recall" in c or "cog" in c:
+        return "cognition"
+    elif "depress" in c or "sad" in c:
+        return "mental_health"
+    elif "social" in c or "friend" in c:
+        return "social"
+    else:
+        return None
+
+
+# ---------------------------
+# BUILD DOMAIN VARIABLE LISTS
+# ---------------------------
+
+def build_domain_variable_lists(df: pd.DataFrame) -> dict[str, dict[str, list[str]]]:
+    """
+    Robust mapping using actual dataset columns (NOT crosswalk)
+    """
+
+    domain_varlists = {}
+
+    for col in df.columns:
+
+        # -----------------------
+        # Detect wave
+        # -----------------------
+        if col.startswith("W1"):
+            wave = "W1"
+        elif col.startswith("W2"):
+            wave = "W2"
+        elif col.startswith("W3"):
+            wave = "W3"
+        else:
+            continue
+
+        # -----------------------
+        # Detect domain
+        # -----------------------
+        domain = detect_domain(col)
+
+        if domain is None:
+            continue
+
+        # -----------------------
+        # Initialize
+        # -----------------------
+        if domain not in domain_varlists:
+            domain_varlists[domain] = {
+                "W1": [],
+                "W2": [],
+                "W3": []
+            }
+
+        domain_varlists[domain][wave].append(col)
+
+    return domain_varlists
+
+
+# ---------------------------
+# BUILD FEATURE TABLE
+# ---------------------------
+
+def build_feature_table(
+    df: pd.DataFrame,
+    domain_varlists: dict[str, dict[str, list[str]]],
+    wave: str = "W1"
+) -> pd.DataFrame:
+
+    frames = []
+
+    for domain, waves in domain_varlists.items():
+
+        vars_ = waves.get(wave, [])
+
+        if not vars_:
+            continue
+
+        cols = [v for v in vars_ if v in df.columns]
+
+        if not cols:
+            continue
+
+        subset = df[cols].copy()
+
+        # Prefix with domain for clarity
+        subset = subset.add_prefix(f"{domain}__")
+
+        frames.append(subset)
+
+    if not frames:
+        return pd.DataFrame(index=df.index)
+
+    return pd.concat(frames, axis=1)
+
+
+# ---------------------------
+# PAIRWISE WAVE FRAMES (DECLINE)
+# ---------------------------
+
+def pairwise_domain_frames(
+    df: pd.DataFrame,
+    domain_varlists: dict[str, dict[str, list[str]]],
+    wave_base: str = "W1",
+    wave_follow: str = "W2"
+):
+
+    base_frames = []
+    follow_frames = []
+
+    for domain, waves in domain_varlists.items():
+
+        base_vars = waves.get(wave_base, [])
+        follow_vars = waves.get(wave_follow, [])
+
+        for base_var in base_vars:
+            follow_var = base_var.replace(wave_base, wave_follow, 1)
+
+            if base_var in df.columns and follow_var in df.columns:
+                base_frames.append(
+                    df[[base_var]].rename(
+                        columns={base_var: f"{domain}__{base_var}"}
+                    )
+                )
+
+                follow_frames.append(
+                    df[[follow_var]].rename(
+                        columns={follow_var: f"{domain}__{follow_var}"}
+                    )
+                )
+
+    base = pd.concat(base_frames, axis=1) if base_frames else pd.DataFrame(index=df.index)
+    follow = pd.concat(follow_frames, axis=1) if follow_frames else pd.DataFrame(index=df.index)
+
+    return base, follow
+
+
+# ---------------------------
+# NUMERIC COERCION
+# ---------------------------
+
+def coalesce_numeric_frame(frame: pd.DataFrame) -> pd.DataFrame:
+
+    out = frame.copy()
+
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    return out
+
+================================================================================
+FILE: features/feature_groups.py
+================================================================================
+
+from __future__ import annotations
+
+DOMAIN_KEYWORDS = {
+    "age": ["age", "years"],
+    "sex": ["sex", "male", "female", "gender"],
+    "education": ["education", "school", "grade", "literacy"],
+    "marital": ["marital", "married", "widow", "divorce", "spouse"],
+    "employment": ["employment", "work", "job", "occupation", "retired"],
+    "household": ["household", "hh", "home", "living arrangement"],
+    "function": ["walk", "walking", "stairs", "stairs", "across room", "chair", "bath", "dressing", "toilet", "function"],
+    "mobility": ["walk", "gait", "balance", "stair", "mobility", "falls", "chair"],
+    "grip": ["grip", "handgrip", "dynamometer"],
+    "blood_pressure": ["blood pressure", "systolic", "diastolic", "bp"],
+    "bmi": ["bmi", "body mass index", "weight", "height", "waist"],
+    "cardiometabolic": ["glucose", "diabetes", "lipid", "cholesterol", "hemoglobin", "hba1c"],
+    "disease": ["hypertension", "diabetes", "stroke", "heart", "lung", "arthritis", "asthma", "tuberculosis"],
+    "hiv": ["hiv", "art", "viral load", "cd4", "aids"],
+    "cognition": ["cognition", "memory", "recall", "orientation", "word list", "verbal fluency"],
+    "mental_health": ["depression", "anxiety", "lonely", "loneliness", "mood", "stress"],
+    "social": ["social", "network", "support", "contact", "participation"],
+    "biomarker": ["biomarker", "lab", "blood", "biomarker", "specimen"],
+}
+
+HIGH_RISK_DIRECTION = {
+    "age": True,
+    "sex": False,
+    "education": False,
+    "marital": False,
+    "employment": False,
+    "household": False,
+    "function": True,
+    "mobility": True,
+    "grip": False,
+    "blood_pressure": True,
+    "bmi": True,
+    "cardiometabolic": True,
+    "disease": True,
+    "hiv": True,
+    "cognition": True,
+    "mental_health": True,
+    "social": True,
+    "biomarker": True,
+}
+
+================================================================================
+FILE: features/frailty_index.py
+================================================================================
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+from data.preprocessing import binary_from_any, safe_numeric
+
+
+FRAILTY_DOMAINS = {
+    "function",
+    "mobility",
+    "grip",
+    "blood_pressure",
+    "bmi",
+    "cardiometabolic",
+    "disease",
+    "hiv",
+    "cognition",
+    "mental_health",
+    "social",
+}
+
+
+def compute_frailty_index(feature_frame: pd.DataFrame) -> pd.Series:
+    """
+    Compute a simple deficit-count frailty index over selected HAALSI domains.
+    The input should already contain numeric columns mapped from the crosswalk.
+    """
+
+    if feature_frame.empty:
+        return pd.Series(dtype="float64")
+
+    deficits = []
+
+    for col in feature_frame.columns:
+        series = pd.to_numeric(feature_frame[col], errors="coerce")
+
+        # Generic deficit rule:
+        # - binary / ordinal adverse indicators: >0 counts as a deficit
+        # - if the column is mostly continuous, we use a robust z-style fallback below
+        valid = series.dropna()
+        if valid.empty:
+            continue
+
+        nunique = valid.nunique(dropna=True)
+
+        if nunique <= 5:
+            deficit = (series > 0).astype(float)
+        else:
+            median = valid.median()
+            mad = (valid - median).abs().median()
+            scale = mad if mad and mad > 0 else valid.std(ddof=0)
+            if not scale or np.isnan(scale) or scale == 0:
+                deficit = pd.Series(0.0, index=series.index)
+            else:
+                z = (series - median) / scale
+                deficit = (z > 1.0).astype(float)
+
+        deficits.append(deficit.rename(col))
+
+    if not deficits:
+        return pd.Series(0.0, index=feature_frame.index, name="frailty_index")
+
+    deficit_df = pd.concat(deficits, axis=1)
+    frailty = deficit_df.mean(axis=1).fillna(0.0)
+    frailty.name = "frailty_index"
+    return frailty
+
+================================================================================
+FILE: features/trajectory_features.py
+================================================================================
+
+def get_domain_columns(domain_varlists, domain, wave):
+    return domain_varlists.get(domain, {}).get(wave, [])
+
+================================================================================
+FILE: inference/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: inference/input_mapper.py
+================================================================================
+
+from __future__ import annotations
+
+from typing import Any, Dict
+import pandas as pd
+
+
+import numpy as np
+
+
+def map_user_inputs_to_frame(user_inputs: Dict[str, Any], feature_columns: list[str], defaults: dict[str, Any]) -> pd.DataFrame:
+    row = {}
+    for col in feature_columns:
+        val = user_inputs.get(col, None)
+        if val is None or val == "" or pd.isna(val):
+            row[col] = np.nan
+        else:
+            row[col] = val
+    return pd.DataFrame([row], columns=feature_columns)
+
+
+def align_frame_to_schema(df: pd.DataFrame, feature_columns: list[str], defaults: dict[str, Any]) -> pd.DataFrame:
+    aligned = df.copy()
+    for col in feature_columns:
+        if col not in aligned.columns:
+            aligned[col] = np.nan
+        else:
+            val = aligned.loc[0, col]
+            if val is None or val == "" or pd.isna(val):
+                aligned.loc[0, col] = np.nan
+    aligned = aligned[feature_columns]
+    return aligned
+
+================================================================================
+FILE: inference/schema.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+import json
+from pathlib import Path
+
+
+@dataclass
+class SchemaArtifact:
+    feature_columns: list[str] = field(default_factory=list)
+    feature_defaults: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "feature_columns": self.feature_columns,
+            "feature_defaults": self.feature_defaults,
+            "metadata": self.metadata,
+        }
+
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "SchemaArtifact":
+        path = Path(path)
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        return cls(
+            feature_columns=data.get("feature_columns", []),
+            feature_defaults=data.get("feature_defaults", {}),
+            metadata=data.get("metadata", {}),
+        )
+
+================================================================================
+FILE: models/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: models/combined_risk.py
+================================================================================
+
+import numpy as np
+import pandas as pd
+
+
+def compute_combined_risk(decline_model, trajectory_model, label_encoder, X):
+
+    # -----------------------
+    # Decline probability
+    # -----------------------
+    decline_probs = decline_model.predict_proba(X)[:, 1]
+
+    # -----------------------
+    # Trajectory prediction
+    # -----------------------
+    traj_score = trajectory_model.predict(X)
+
+    # normalize between 0 and 1
+    traj_score = (traj_score - traj_score.min()) / (traj_score.max() - traj_score.min())
+
+    # -----------------------
+    # Combine risk
+    # -----------------------
+    combined = 0.6 * decline_probs + 0.4 * traj_score
+
+    # Normalize
+    combined = np.clip(combined, 0, 1)
+
+    return pd.DataFrame({
+        "decline_risk": decline_probs,
+        "trajectory_score": traj_score,
+        "combined_risk": combined
+    })
+
+================================================================================
+FILE: models/decline_model.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    brier_score_loss,
+    classification_report,
+    roc_auc_score,
+)
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+from xgboost import XGBClassifier
+
+from config.haalsi_config import RANDOM_STATE
+
+
+@dataclass
+class TrainedModelBundle:
+    model: Any
+    feature_columns: list[str]
+    metrics: dict[str, float]
+
+
+def build_model(random_state: int = RANDOM_STATE) -> Pipeline:
+    base = XGBClassifier(
+        n_estimators=250,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=random_state,
+        tree_method="hist",
+    )
+
+    # XGBoost handles missing values directly, but the imputer keeps the pipeline explicit.
+    model = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler(with_mean=False)),
+            ("clf", base),
+        ]
+    )
+    return model
+
+
+def calibrate_model(model: Pipeline, X_train: pd.DataFrame, y_train: pd.Series) -> CalibratedClassifierCV:
+    calibrator = CalibratedClassifierCV(model, method="sigmoid", cv=3)
+    calibrator.fit(X_train, y_train)
+    return calibrator
+
+
+def train_decline_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float = 0.2,
+    random_state: int = RANDOM_STATE,
+) -> TrainedModelBundle:
+    feature_columns = list(X.columns)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=test_size,
+        stratify=y if y.nunique() > 1 else None,
+        random_state=random_state,
+    )
+
+    model = build_model(random_state=random_state)
+    calibrated = calibrate_model(model, X_train, y_train)
+
+    proba = calibrated.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, proba) if y_test.nunique() > 1 else float("nan")
+    brier = brier_score_loss(y_test, proba) if len(np.unique(y_test)) > 1 else float("nan")
+
+    preds = (proba >= 0.5).astype(int)
+    report = classification_report(y_test, preds, output_dict=True, zero_division=0)
+
+    metrics = {
+        "auc": float(auc) if auc == auc else np.nan,
+        "brier": float(brier) if brier == brier else np.nan,
+        "precision": float(report.get("1", {}).get("precision", np.nan)),
+        "recall": float(report.get("1", {}).get("recall", np.nan)),
+        "f1": float(report.get("1", {}).get("f1-score", np.nan)),
+    }
+
+    return TrainedModelBundle(model=calibrated, feature_columns=feature_columns, metrics=metrics)
+
+
+def save_model_bundle(bundle: TrainedModelBundle, model_path, feature_columns_path=None):
+    joblib.dump(bundle.model, model_path)
+    if feature_columns_path is not None:
+        import json
+        from pathlib import Path
+
+        feature_columns_path = Path(feature_columns_path)
+        feature_columns_path.parent.mkdir(parents=True, exist_ok=True)
+        feature_columns_path.write_text(json.dumps(bundle.feature_columns, indent=2), encoding="utf-8")
+
+================================================================================
+FILE: models/risk_fusion.py
+================================================================================
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+from config.haalsi_config import AGE_WEIGHT, DECLINE_WEIGHT, FRAILTY_WEIGHT
+
+
+def _normalize_age(age: pd.Series | float | int) -> pd.Series:
+    if isinstance(age, (float, int)):
+        return pd.Series([age], dtype="float64")
+    return pd.to_numeric(age, errors="coerce").fillna(age.median() if hasattr(age, "median") else 0)
+
+
+def fuse_risk(frailty: pd.Series, decline_prob: pd.Series, age: pd.Series) -> pd.Series:
+    age_s = pd.to_numeric(age, errors="coerce")
+    age_scaled = (age_s - age_s.min()) / (age_s.max() - age_s.min() + 1e-9)
+    frailty_s = pd.to_numeric(frailty, errors="coerce").fillna(0.0).clip(0, 1)
+    decline_s = pd.to_numeric(decline_prob, errors="coerce").fillna(0.0).clip(0, 1)
+
+    risk = (
+        FRAILTY_WEIGHT * frailty_s +
+        DECLINE_WEIGHT * decline_s +
+        AGE_WEIGHT * age_scaled
+    ).clip(0, 1)
+    risk.name = "fused_risk"
+    return risk
+
+
+def categorize_risk(risk: pd.Series) -> pd.Series:
+    bins = [-np.inf, 0.30, 0.55, 0.75, np.inf]
+    labels = ["Low", "Moderate", "High", "Very High"]
+    return pd.cut(risk, bins=bins, labels=labels, right=False)
+
+================================================================================
+FILE: models/trajectory_clustering.py
+================================================================================
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler
+
+
+def cluster_trajectories(features: pd.DataFrame, n_clusters: int = 3):
+    """
+    Fit a standardized Gaussian mixture model to temporal trajectory features.
+    Returns cluster labels and a serializable model bundle.
+    """
+    if features.empty:
+        raise ValueError("Trajectory feature matrix is empty.")
+
+    clean = features.replace([np.inf, -np.inf], np.nan)
+    clean = clean.fillna(clean.median(numeric_only=True))
+
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(clean)
+
+    gmm = GaussianMixture(
+        n_components=n_clusters,
+        covariance_type="diag",
+        reg_covar=1e-6,
+        random_state=42,
+    )
+
+    labels = gmm.fit_predict(scaled)
+
+    model_bundle = {
+        "scaler": scaler,
+        "gmm": gmm,
+        "feature_columns": list(clean.columns),
+        "n_clusters": n_clusters,
+    }
+
+    return labels, model_bundle
+
+================================================================================
+FILE: models/trajectory_model.py
+================================================================================
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from xgboost import XGBRegressor
+
+
+def _safe_predict_labels(model: XGBClassifier, X_test: pd.DataFrame) -> np.ndarray:
+    probs = model.predict_proba(X_test)
+
+    # Multiclass: shape = (n_samples, n_classes)
+    if getattr(probs, "ndim", 1) == 2:
+        return probs.argmax(axis=1)
+
+    # Binary fallback
+    return (probs > 0.5).astype(int)
+
+
+def train_trajectory_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    random_state: int = 42,
+) -> XGBRegressor:
+    y = pd.Series(y, index=X.index)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=random_state,
+        stratify=None,
+    )
+
+    model = XGBRegressor(
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=42
+    )
+
+    model.fit(X_train, y_train)
+
+    preds = model.predict(X_test)
+
+    from sklearn.metrics import r2_score, mean_squared_error
+
+    print("\n[INFO] Trajectory Regression Performance:")
+    print("R2:", r2_score(y_test, preds))
+    print("RMSE:", mean_squared_error(y_test, preds)**0.5)
+
+    return model
+
+================================================================================
+FILE: pipeline/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: pipeline/train_pipeline.py
+================================================================================
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+
+from config.haalsi_config import (
+    DATA_PATH,
+    MODEL_FILE,
+    FEATURE_COLUMNS_FILE,
+    FEATURE_DEFAULTS_FILE,
+    SCHEMA_FILE,
+    ARTIFACT_DIR,
+)
+
+from data.loader import load_haalsi_data
+from data.preprocessing import clean_missing_values, standardize_column_names
+
+from features.feature_builder import (
+    build_domain_variable_lists,
+    build_feature_table,
+)
+from features.frailty_index import compute_frailty_index
+
+from targets.decline_label import compute_decline_label
+from pipeline.trajectory_pipeline import build_trajectory_labels
+
+from models.decline_model import train_decline_model
+from models.trajectory_model import train_trajectory_model
+
+from inference.schema import SchemaArtifact
+
+
+def ensure_dirs() -> None:
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _coerce_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def build_training_matrices(df, domain_varlists):
+
+    # -----------------------
+    # BASELINE FEATURES (W1 ONLY)
+    # -----------------------
+    X = build_feature_table(df, domain_varlists, wave="W1")
+
+    if X.empty:
+        raise ValueError("No W1 features found.")
+
+    # -----------------------
+    # NUMERIC CLEAN
+    # -----------------------
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+
+    # -----------------------
+    # DOMAIN GROUPING
+    # -----------------------
+    domain_map = {}
+    for col in X.columns:
+        if "__" not in col:
+            continue
+        domain = col.split("__")[0]
+        domain_map.setdefault(domain, []).append(col)
+
+    # -----------------------
+    # DOMAIN-LEVEL FEATURES (HIGH IMPACT)
+    # -----------------------
+    for d, cols in domain_map.items():
+
+        block = X[cols]
+
+        # Mean health
+        X[f"{d}_mean"] = block.mean(axis=1)
+
+        # Variability within domain
+        if len(cols) > 1:
+            X[f"{d}_std"] = block.std(axis=1)
+
+        # Missingness
+        X[f"{d}_missing_frac"] = block.isna().mean(axis=1)
+
+        # Impairment proxy (below median)
+        median_val = block.median().median()
+        X[f"{d}_impairment"] = (block.mean(axis=1) < median_val).astype(int)
+
+        X[f"{d}_count"] = block.notna().sum(axis=1)
+
+    # -----------------------
+    # GLOBAL FEATURES
+    # -----------------------
+    X["global_mean"] = X.mean(axis=1)
+    X["global_missing"] = X.isna().mean(axis=1)
+
+    global_std = X.std(axis=1)
+    X["health_index"] = X["global_mean"] / (1 + global_std)
+
+    # Frailty
+    X["frailty_index"] = compute_frailty_index(X)
+
+    # -----------------------
+    # INTERACTIONS (VERY IMPORTANT)
+    # -----------------------
+    if "age_proxy" in X.columns:
+        X["age_frailty"] = X["age_proxy"] * X["frailty_index"]
+
+    # -----------------------
+    # FOLLOW-UP (ONLY FOR LABEL)
+    # -----------------------
+    follow = build_feature_table(df, domain_varlists, wave="W2")
+
+    y_decline = compute_decline_label(X, follow)
+
+    # -----------------------
+    # TRAJECTORY
+    # -----------------------
+    y_trajectory, traj_cluster_model = build_trajectory_labels(df, domain_varlists)
+
+    # -----------------------
+    # FINAL CLEAN
+    # -----------------------
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(X.median(numeric_only=True))
+
+    y_decline = y_decline.reindex(X.index).fillna(0).astype(int)
+    y_trajectory = y_trajectory.reindex(X.index)
+
+    return X, y_decline, y_trajectory, traj_cluster_model
+
+
+def run_training():
+    print("\n[PIPELINE] Starting HAALSI training pipeline...\n")
+    ensure_dirs()
+
+    # Load and clean
+    df = load_haalsi_data(DATA_PATH)
+    df = standardize_column_names(df)
+    df = clean_missing_values(df)
+    print("[INFO] Data cleaned")
+
+    # Build domain map directly from the dataset
+    domain_varlists = build_domain_variable_lists(df)
+    print(f"[INFO] Domains detected: {list(domain_varlists.keys())}")
+
+    # Build matrices
+    print("[INFO] Building training matrices...")
+    X, y_decline, y_trajectory, traj_cluster_model = build_training_matrices(df, domain_varlists)
+    print(f"[INFO] Feature matrix shape: {X.shape}")
+
+    # Decline model
+    print("\n[MODEL] Training decline model...")
+    decline_bundle = train_decline_model(X, y_decline)
+    joblib.dump(decline_bundle.model, MODEL_FILE)
+    joblib.dump(decline_bundle.model, MODEL_FILE.parent / "decline_model.joblib")
+
+    # Trajectory model
+    print("\n[MODEL] Training trajectory model...")
+    trajectory_model = train_trajectory_model(X, y_trajectory)
+    joblib.dump(trajectory_model, MODEL_FILE.parent / "trajectory_model.joblib")
+    joblib.dump(traj_cluster_model, MODEL_FILE.parent / "trajectory_cluster_model.joblib")
+
+    # --------------------------------------------------
+    # PART 1 — TRAJECTORY OUTPUT CALIBRATION & SCALING
+    # --------------------------------------------------
+    from sklearn.preprocessing import QuantileTransformer
+    trajectory_scaler = QuantileTransformer(n_quantiles=1000, random_state=42, output_distribution='uniform')
+    trajectory_scaler.fit(y_trajectory.to_numpy().reshape(-1, 1))
+    joblib.dump(trajectory_scaler, MODEL_FILE.parent / "trajectory_scaler.joblib")
+
+    # Compute percentiles on the scaled values (since the scaler transforms targets into percentiles)
+    y_trajectory_scaled = trajectory_scaler.transform(y_trajectory.to_numpy().reshape(-1, 1)).flatten()
+    
+    # Save raw and scaled thresholds
+    raw_t33 = float(np.percentile(y_trajectory, 33))
+    raw_t66 = float(np.percentile(y_trajectory, 66))
+    scaled_t33 = float(np.percentile(y_trajectory_scaled, 33))
+    scaled_t66 = float(np.percentile(y_trajectory_scaled, 66))
+    
+    thresholds = {
+        "raw_lower": raw_t33,
+        "raw_upper": raw_t66,
+        "scaled_lower": scaled_t33,
+        "scaled_upper": scaled_t66
+    }
+    
+    with open(MODEL_FILE.parent / "trajectory_thresholds.json", "w", encoding="utf-8") as f:
+        json.dump(thresholds, f, indent=2)
+
+    # --------------------------------------------------
+    # PART 7 — VALIDATION IMPROVEMENT (CROSS-VALIDATION)
+    # --------------------------------------------------
+    from sklearn.model_selection import StratifiedKFold, KFold
+    from sklearn.metrics import roc_auc_score, r2_score
+    from models.decline_model import build_model, calibrate_model
+    from xgboost import XGBRegressor
+
+    print("\n[CV] Running 5-fold cross-validation...")
+
+    # CV for decline model
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    decline_auc_scores = []
+    for train_idx, test_idx in skf.split(X, y_decline):
+        X_train_cv, X_test_cv = X.iloc[train_idx], X.iloc[test_idx]
+        y_train_cv, y_test_cv = y_decline.iloc[train_idx], y_decline.iloc[test_idx]
+        
+        m_decline = build_model(random_state=42)
+        calibrated_decline = calibrate_model(m_decline, X_train_cv, y_train_cv)
+        
+        proba = calibrated_decline.predict_proba(X_test_cv)[:, 1]
+        decline_auc_scores.append(roc_auc_score(y_test_cv, proba))
+        
+    mean_auc = np.mean(decline_auc_scores)
+    std_auc = np.std(decline_auc_scores)
+    print(f"Decline Model CV AUC: {mean_auc:.4f} ± {std_auc:.4f}")
+
+    # CV for trajectory model
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    traj_r2_scores = []
+    for train_idx, test_idx in kf.split(X, y_trajectory):
+        X_train_cv, X_test_cv = X.iloc[train_idx], X.iloc[test_idx]
+        y_train_cv, y_test_cv = y_trajectory.iloc[train_idx], y_trajectory.iloc[test_idx]
+        
+        m_traj = XGBRegressor(
+            n_estimators=500,
+            max_depth=6,
+            learning_rate=0.03,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=42
+        )
+        m_traj.fit(X_train_cv, y_train_cv)
+        preds_cv = m_traj.predict(X_test_cv)
+        traj_r2_scores.append(r2_score(y_test_cv, preds_cv))
+        
+    mean_r2 = np.mean(traj_r2_scores)
+    std_r2 = np.std(traj_r2_scores)
+    print(f"Trajectory Model CV R2: {mean_r2:.4f} ± {std_r2:.4f}")
+
+    from models.combined_risk import compute_combined_risk
+
+    # Load encoder
+    try:
+        label_encoder = joblib.load("outputs/models/trajectory_label_encoder.joblib")
+    except Exception:
+        label_encoder = None
+
+    combined_df = compute_combined_risk(
+        decline_bundle.model,
+        trajectory_model,
+        label_encoder,
+        X
+    )
+
+    print("\n[INFO] Combined Risk Summary:")
+    print(combined_df.describe())
+
+    # Artifacts
+    FEATURE_COLUMNS_FILE.write_text(
+        json.dumps(list(X.columns), indent=2),
+        encoding="utf-8",
+    )
+
+    defaults = {str(k): v for k, v in X.median(numeric_only=True).to_dict().items()}
+    FEATURE_DEFAULTS_FILE.write_text(
+        json.dumps(defaults, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+    schema = SchemaArtifact(
+        feature_columns=list(X.columns),
+        feature_defaults=defaults,
+        metadata={
+            "decline_metrics": decline_bundle.metrics,
+            "cv_metrics": {
+                "decline_mean_auc": mean_auc,
+                "decline_std_auc": std_auc,
+                "trajectory_mean_r2": mean_r2,
+                "trajectory_std_r2": std_r2
+            }
+        },
+    )
+    schema.save(SCHEMA_FILE)
+
+    print("\n[PIPELINE COMPLETE]\n")
+    print("Decline Model Metrics:")
+    print(json.dumps(decline_bundle.metrics, indent=2))
+    print("\nTrajectory Model Saved")
+    print("\nArtifacts:")
+    print(f"- Model: {MODEL_FILE}")
+    print(f"- Trajectory Model: {MODEL_FILE.parent / 'trajectory_model.joblib'}")
+    print(f"- Schema: {SCHEMA_FILE}")
+
+
+if __name__ == "__main__":
+    run_training()
+
+================================================================================
+FILE: pipeline/trajectory_pipeline.py
+================================================================================
+
+from __future__ import annotations
+
+import pandas as pd
+import numpy as np
+
+from targets.trajectory_utils import compute_domain_score
+from models.trajectory_clustering import cluster_trajectories
+
+
+def print_domain_availability(domain_varlists):
+    print("\n[DEBUG] Domain availability:")
+    for d in domain_varlists:
+        w1 = len(domain_varlists[d].get("W1", []))
+        w2 = len(domain_varlists[d].get("W2", []))
+        w3 = len(domain_varlists[d].get("W3", []))
+        print(f"{d:20s} | W1: {w1:3d} | W2: {w2:3d} | W3: {w3:3d}")
+
+
+def zscore_series(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    mu = s.mean()
+    sigma = s.std(ddof=0)
+    if pd.isna(sigma) or sigma == 0:
+        return pd.Series(0.0, index=s.index)
+    return (s - mu) / sigma
+
+
+def compute_multidomain_scores(df: pd.DataFrame, domain_varlists):
+    """
+    Build a composite longitudinal signal from domains that are present in W1, W2, and W3.
+    Each domain score is z-scored before averaging so one scale cannot dominate the others.
+    """
+    preferred_domains = ["mobility", "disease", "cognition", "bmi"]
+
+    used_domains = []
+    w1_scores = []
+    w2_scores = []
+    w3_scores = []
+
+    print("\n[INFO] Domains used for trajectory:")
+
+    for d in preferred_domains:
+        w1_cols = domain_varlists.get(d, {}).get("W1", [])
+        w2_cols = domain_varlists.get(d, {}).get("W2", [])
+        w3_cols = domain_varlists.get(d, {}).get("W3", [])
+
+        if w1_cols and w2_cols and w3_cols:
+            used_domains.append(d)
+            print(f" - {d}")
+
+            w1_scores.append(zscore_series(compute_domain_score(df, w1_cols)))
+            w2_scores.append(zscore_series(compute_domain_score(df, w2_cols)))
+            w3_scores.append(zscore_series(compute_domain_score(df, w3_cols)))
+
+    if not used_domains:
+        raise ValueError("No valid domains found for trajectory modeling.")
+
+    weights = {
+        "mobility": 2.0,
+        "disease": 1.5,
+        "bmi": 1.0
+    }
+
+    w1_list, w2_list, w3_list = [], [], []
+
+    for d in used_domains:
+        weight = weights.get(d, 1.0)
+
+        w1_list.append(weight * compute_domain_score(df, domain_varlists[d]["W1"]))
+        w2_list.append(weight * compute_domain_score(df, domain_varlists[d]["W2"]))
+        w3_list.append(weight * compute_domain_score(df, domain_varlists[d]["W3"]))
+
+    w1 = pd.concat(w1_list, axis=1).mean(axis=1)
+    w2 = pd.concat(w2_list, axis=1).mean(axis=1)
+    w3 = pd.concat(w3_list, axis=1).mean(axis=1)
+
+    return w1, w2, w3, used_domains
+
+
+def extract_trajectory_features(w1: pd.Series, w2: pd.Series, w3: pd.Series) -> pd.DataFrame:
+    delta1 = w2 - w1
+    delta2 = w3 - w2
+    slope = (w3 - w1) / 2.0
+    acceleration = delta2 - delta1
+    variability = pd.concat([w1, w2, w3], axis=1).std(axis=1)
+
+    return pd.DataFrame(
+        {
+            "delta1": delta1,
+            "delta2": delta2,
+            "slope": slope,
+            "acceleration": acceleration,
+            "variability": variability,
+        }
+    )
+
+
+def label_clusters(traj_features: pd.DataFrame, labels) -> tuple[pd.Series, dict[int, str]]:
+    """
+    Map latent clusters to clinical labels using rank order of temporal trend.
+    Higher trajectory score = worse progression.
+    """
+    df = traj_features.copy()
+    df["cluster"] = labels
+
+    summary = df.groupby("cluster")[["delta1", "delta2", "slope", "acceleration", "variability"]].mean()
+
+    summary["trajectory_score"] = (
+        0.60 * summary["slope"]
+        + 0.25 * summary["acceleration"]
+        + 0.15 * summary["variability"]
+    )
+
+    ordered_clusters = summary["trajectory_score"].sort_values(ascending=False).index.tolist()
+
+    label_names = ["Rapid Decline", "Slow Decline", "Stable"]
+    label_map: dict[int, str] = {}
+
+    for i, cluster_id in enumerate(ordered_clusters):
+        label_map[int(cluster_id)] = label_names[min(i, len(label_names) - 1)]
+
+    print("\n[INFO] Cluster interpretation:")
+    for k in sorted(label_map):
+        print(f"Cluster {k} → {label_map[k]}")
+
+    labeled_series = pd.Series(labels, index=traj_features.index).map(label_map)
+    return labeled_series, label_map
+
+
+def build_trajectory_labels(df: pd.DataFrame, domain_varlists):
+    print_domain_availability(domain_varlists)
+
+    w1, w2, w3, used_domains = compute_multidomain_scores(df, domain_varlists)
+
+    traj_features = extract_trajectory_features(w1, w2, w3)
+    traj_features = traj_features.replace([np.inf, -np.inf], np.nan)
+    traj_features = traj_features.fillna(traj_features.median(numeric_only=True))
+
+    labels, model = cluster_trajectories(traj_features)
+
+    # -----------------------
+    # STABLE TRAJECTORY SCORE
+    # -----------------------
+
+    # Primary signal: long-term change
+    delta_long = (w3 - w1)
+
+    # Secondary signal: early change
+    delta_mid = (w2 - w1)
+
+    # Weighted combination
+    trajectory_score = 0.7 * delta_long + 0.3 * delta_mid
+
+    trajectory_score = (trajectory_score - trajectory_score.mean()) / trajectory_score.std()
+
+    trajectory_score = trajectory_score.clip(-3, 3)
+
+    trajectory_score = trajectory_score.replace([np.inf, -np.inf], np.nan)
+    trajectory_score = trajectory_score.fillna(trajectory_score.median())
+
+    return trajectory_score, model
+
+================================================================================
+FILE: simulation/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: simulation/aging_simulator.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+from models.risk_fusion import fuse_risk
+
+
+@dataclass
+class TrajectoryResult:
+    horizon_years: int
+    mean_risk: float
+    std_risk: float
+
+
+def estimate_wave_drift(base: pd.DataFrame, follow: pd.DataFrame) -> pd.Series:
+    base_num = base.apply(pd.to_numeric, errors="coerce")
+    follow_num = follow.apply(pd.to_numeric, errors="coerce")
+
+    common = [c for c in base_num.columns if c in follow_num.columns]
+    if not common:
+        return pd.Series(dtype="float64")
+
+    drift = (follow_num[common].mean(numeric_only=True) - base_num[common].mean(numeric_only=True))
+    return drift.fillna(0.0)
+
+
+def simulate_forward_risk(
+    base_features: pd.DataFrame,
+    model,
+    frailty: pd.Series,
+    age: pd.Series,
+    horizons=(1, 3, 5),
+    n_simulations: int = 500,
+    drift_scale: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Very first-pass pseudo-longitudinal simulator:
+    - draws noisy perturbations around current features
+    - rescored by the trained model
+    - then fused with frailty and age
+    """
+    rng = np.random.default_rng(42)
+    base = base_features.copy()
+
+    rows = []
+    feature_cols = list(base.columns)
+
+    base_proba = model.predict_proba(base)[:, 1] if hasattr(model, "predict_proba") else model.predict(base)
+
+    for h in horizons:
+        sims = []
+        for _ in range(n_simulations):
+            perturbed = base.copy()
+
+            for c in feature_cols:
+                s = pd.to_numeric(perturbed[c], errors="coerce")
+                noise = rng.normal(0, 0.05 * max(float(s.std(skipna=True) or 1.0), 1.0), size=len(s))
+                perturbed[c] = (s + drift_scale * h * noise).astype(float)
+
+            p = model.predict_proba(perturbed)[:, 1] if hasattr(model, "predict_proba") else model.predict(perturbed)
+            fused = fuse_risk(frailty=frailty, decline_prob=pd.Series(p, index=base.index), age=age)
+            sims.append(fused.values)
+
+        sims_arr = np.vstack(sims)
+        rows.append(
+            {
+                "horizon_years": h,
+                "mean_risk": float(np.nanmean(sims_arr)),
+                "std_risk": float(np.nanstd(sims_arr)),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+================================================================================
+FILE: simulation/time_to_event.py
+================================================================================
+
+from __future__ import annotations
+
+import pandas as pd
+from simulation.aging_simulator import simulate_forward_risk
+
+
+def estimate_time_to_independence_loss(
+    base_features: pd.DataFrame,
+    decline_model,
+    frailty: pd.Series,
+    age: pd.Series,
+    threshold: float = 0.75,
+    horizons=(1, 2, 3, 5, 7, 10),
+) -> int | str:
+    """
+    Estimate the time to loss of independence based on pseudo-longitudinal forward simulations.
+    Returns the earliest simulated horizon year where mean risk exceeds the threshold,
+    or "Low long-term risk" if the threshold is never met.
+    """
+    sim_df = simulate_forward_risk(
+        base_features=base_features,
+        model=decline_model,
+        frailty=frailty,
+        age=age,
+        horizons=horizons,
+        n_simulations=500,
+    )
+
+    for _, row in sim_df.iterrows():
+        if row["mean_risk"] >= threshold:
+            return int(row["horizon_years"])
+
+    return "Low long-term risk"
+
+
+================================================================================
+FILE: targets/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: targets/decline_label.py
+================================================================================
+
+from __future__ import annotations
+
+import pandas as pd
+import numpy as np
+
+
+def compute_decline_label(X_w1: pd.DataFrame, X_w2: pd.DataFrame) -> pd.Series:
+    """
+    Compute decline using domain-aligned aggregation.
+
+    Works for HAALSI where W1 and W2 variable names differ.
+    """
+
+    # -----------------------
+    # Extract domains
+    # -----------------------
+    def group_by_domain(df):
+        domain_map = {}
+
+        for col in df.columns:
+            if "__" not in col:
+                continue
+
+            domain = col.split("__")[0]
+
+            if domain not in domain_map:
+                domain_map[domain] = []
+
+            domain_map[domain].append(col)
+
+        return domain_map
+
+    w1_domains = group_by_domain(X_w1)
+    w2_domains = group_by_domain(X_w2)
+
+    common_domains = set(w1_domains.keys()).intersection(w2_domains.keys())
+
+    if not common_domains:
+        raise ValueError("No overlapping domains between W1 and W2.")
+
+    w1_scores = []
+    w2_scores = []
+
+    # -----------------------
+    # Compute per-domain scores
+    # -----------------------
+    for d in common_domains:
+
+        w1_cols = w1_domains[d]
+        w2_cols = w2_domains[d]
+
+        if not w1_cols or not w2_cols:
+            continue
+
+        w1_block = X_w1[w1_cols].apply(pd.to_numeric, errors="coerce")
+        w2_block = X_w2[w2_cols].apply(pd.to_numeric, errors="coerce")
+
+        # Standardize within domain
+        w1_std = (w1_block - w1_block.mean()) / w1_block.std(ddof=0)
+        w2_std = (w2_block - w2_block.mean()) / w2_block.std(ddof=0)
+
+        w1_scores.append(w1_std.mean(axis=1))
+        w2_scores.append(w2_std.mean(axis=1))
+
+    if not w1_scores:
+        raise ValueError("No usable domains for decline computation.")
+
+    # -----------------------
+    # Aggregate across domains
+    # -----------------------
+    score_w1 = pd.concat(w1_scores, axis=1).mean(axis=1)
+    score_w2 = pd.concat(w2_scores, axis=1).mean(axis=1)
+
+    # -----------------------
+    # Decline
+    # -----------------------
+    delta = score_w2 - score_w1
+
+    y = (delta > 0).astype(int)
+
+    return y
+
+================================================================================
+FILE: targets/trajectory_label.py
+================================================================================
+
+import pandas as pd
+import numpy as np
+
+
+def compute_domain_score(df, columns):
+    """
+    Aggregate a domain (e.g., mobility, cognition)
+    """
+    subset = df[columns].apply(pd.to_numeric, errors="coerce")
+    return subset.mean(axis=1)
+
+
+def compute_trajectory_score(w1_score, w2_score, w3_score):
+    """
+    Compute change pattern
+    """
+    delta1 = w2_score - w1_score
+    delta2 = w3_score - w2_score
+
+    return delta1, delta2
+
+
+def assign_trajectory_class(delta1, delta2):
+    """
+    Rule-based trajectory classification
+    """
+
+    traj = []
+
+    for d1, d2 in zip(delta1, delta2):
+        if pd.isna(d1) or pd.isna(d2):
+            traj.append("Unknown")
+
+        elif d1 <= 0 and d2 <= 0:
+            traj.append("Stable")
+
+        elif d1 > 0 and d2 > 0:
+            traj.append("Rapid Decline")
+
+        elif d1 > 0 and d2 <= 0:
+            traj.append("Recovery")
+
+        elif d1 <= 0 and d2 > 0:
+            traj.append("Late Decline")
+
+        else:
+            traj.append("Mixed")
+
+    return pd.Series(traj)
+
+================================================================================
+FILE: targets/trajectory_utils.py
+================================================================================
+
+import pandas as pd
+import numpy as np
+
+
+def zscore(series):
+    mean = series.mean()
+    std = series.std()
+    if std == 0 or pd.isna(std):
+        return pd.Series(0, index=series.index)
+    return (series - mean) / std
+
+
+def compute_domain_score(df, columns):
+    """
+    Standardized domain score (robust)
+    """
+
+    subset = df[columns].apply(pd.to_numeric, errors="coerce")
+
+    # Normalize each variable
+    subset = subset.apply(zscore)
+
+    # Average
+    score = subset.mean(axis=1)
+
+    return score
+

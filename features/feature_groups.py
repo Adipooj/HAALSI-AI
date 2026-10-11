@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+DOMAIN_KEYWORDS = {
+    "age": ["age", "years"],
+    "sex": ["sex", "male", "female", "gender"],
+    "education": ["education", "school", "grade", "literacy"],
+    "marital": ["marital", "married", "widow", "divorce", "spouse"],
+    "employment": ["employment", "work", "job", "occupation", "retired"],
+    "household": ["household", "hh", "home", "living arrangement"],
+    "function": ["walk", "walking", "stairs", "stairs", "across room", "chair", "bath", "dressing", "toilet", "function"],
+    "mobility": ["walk", "gait", "balance", "stair", "mobility", "falls", "chair"],
+    "grip": ["grip", "handgrip", "dynamometer"],
+    "blood_pressure": ["blood pressure", "systolic", "diastolic", "bp"],
+    "bmi": ["bmi", "body mass index", "weight", "height", "waist"],
+    "cardiometabolic": ["glucose", "diabetes", "lipid", "cholesterol", "hemoglobin", "hba1c"],
+    "disease": ["hypertension", "diabetes", "stroke", "heart", "lung", "arthritis", "asthma", "tuberculosis"],
+    "hiv": ["hiv", "art", "viral load", "cd4", "aids"],
+    "cognition": ["cognition", "memory", "recall", "orientation", "word list", "verbal fluency"],
+    "mental_health": ["depression", "anxiety", "lonely", "loneliness", "mood", "stress"],
+    "social": ["social", "network", "support", "contact", "participation"],
+    "biomarker": ["biomarker", "lab", "blood", "biomarker", "specimen"],
+}
+
+HIGH_RISK_DIRECTION = {
+    "age": True,
+    "sex": False,
+    "education": False,
+    "marital": False,
+    "employment": False,
+    "household": False,
+    "function": True,
+    "mobility": True,
+    "grip": False,
+    "blood_pressure": True,
+    "bmi": True,
+    "cardiometabolic": True,
+    "disease": True,
+    "hiv": True,
+    "cognition": True,
+    "mental_health": True,
+    "social": True,
+    "biomarker": True,
+}
